@@ -3,24 +3,31 @@ const cron = require("node-cron");
 const axios = require("axios");
 
 // ─────────────────────────────────────────────
-// CONFIG — all values from .env
+// CONFIG
 // ─────────────────────────────────────────────
-const {
-  ANTHROPIC_API_KEY,
-  ASANA_ACCESS_TOKEN,
-  SLACK_BOT_TOKEN,
-  SLACK_CHANNEL_ID,         // #portal-product-feedback = C0AC8P92G3B
-  ASANA_PROJECT_GID,        // Portal Stabilisation = 1213802028079816
-  TIMEZONE,                 // Australia/Sydney
-} = process.env;
+const { ANTHROPIC_API_KEY, ASANA_ACCESS_TOKEN, SLACK_BOT_TOKEN, SLACK_CHANNEL_ID, ASANA_PROJECT_GID, TIMEZONE } = process.env;
 
-const PROJECT_GID   = ASANA_PROJECT_GID  || "1213802028079816";
-const CHANNEL_ID    = SLACK_CHANNEL_ID   || "C0AC8P92G3B";
-const TZ            = TIMEZONE           || "Australia/Sydney";
-const ASANA_BASE    = "https://app.asana.com/api/1.0";
+const PROJECT_GID    = ASANA_PROJECT_GID || "1213802028079816";
+const CHANNEL_ID     = SLACK_CHANNEL_ID  || "C0AC8P92G3B";
+const TZ             = TIMEZONE          || "Australia/Sydney";
+const ASANA_BASE     = "https://app.asana.com/api/1.0";
 const ASANA_TASK_URL = (gid) => `https://app.asana.com/0/${PROJECT_GID}/${gid}/f`;
 
-// Owner map: Asana GID → { name, slack }
+// Board section GIDs → names
+const BOARD_SECTIONS = {
+  "1213802028079817": "Backlog",
+  "1213802028079820": "Prioritised",
+  "1213815704002761": "Planned",
+  "1213863123247950": "In Progress",
+  "1213863123247951": "Testing",
+  "1213863123247952": "Done",
+};
+
+const STATUS_EMOJI = {
+  "Backlog": "⬜", "Prioritised": "🔷", "Planned": "🔵",
+  "In Progress": "🟡", "Testing": "🟠", "Done": "🟢",
+};
+
 const OWNERS = {
   "1213776006274031": { name: "Pete",   slack: "U06MSUARQ77" },
   "1213778917763529": { name: "Saber",  slack: "U09FT29J3LH" },
@@ -28,22 +35,18 @@ const OWNERS = {
   "1213779385519783": { name: "Chayan", slack: "U06S0T3UFFB" },
 };
 
-// Slack IDs to watch for auto-task conversion
-const WATCH_USERS = {
-  "U06LB8LJ50R": "Dali",
-  "U06MSUARQ77": "Pete",
-};
+const WATCH_USERS = { "U06LB8LJ50R": "Dali", "U06MSUARQ77": "Pete" };
 
-// Track last processed message ts to avoid duplicates
-let lastProcessedTs = (Date.now() / 1000 - 3600).toString(); // start 1hr ago
+// In-memory state
+let previousStatus   = {};  // { taskGid: "In Progress" }
+let lastProcessedTs  = (Date.now() / 1000 - 3600).toString();
 
 // ─────────────────────────────────────────────
 // ASANA HELPERS
 // ─────────────────────────────────────────────
 async function asanaGet(path, params = {}) {
   const res = await axios.get(`${ASANA_BASE}${path}`, {
-    headers: { Authorization: `Bearer ${ASANA_ACCESS_TOKEN}` },
-    params,
+    headers: { Authorization: `Bearer ${ASANA_ACCESS_TOKEN}` }, params,
   });
   return res.data.data;
 }
@@ -57,41 +60,47 @@ async function asanaPost(path, body) {
 
 async function fetchAllTasks() {
   const tasks = await asanaGet(`/projects/${PROJECT_GID}/tasks`, {
-    opt_fields: "gid,name,completed,assignee,assignee.name,custom_fields,notes,due_on",
+    opt_fields: "gid,name,completed,assignee,assignee.name,custom_fields,notes,memberships,memberships.section,memberships.section.name,memberships.section.gid",
     limit: 100,
   });
   return tasks.filter((t) => !t.completed);
 }
 
-function getTaskScope(task) {
-  if (!task.custom_fields) return "General";
-  const scopeField = task.custom_fields.find((f) => f.gid === "1213815702340197");
-  return scopeField?.text_value || "General";
+function getBoardStatus(task) {
+  if (!task.memberships || !task.memberships.length) return "Backlog";
+  const m = task.memberships.find((m) => m.section && BOARD_SECTIONS[m.section.gid]);
+  return m ? BOARD_SECTIONS[m.section.gid] : "Backlog";
 }
 
-function getTaskStatus(task) {
-  if (!task.custom_fields) return "Open";
-  const statusField = task.custom_fields.find((f) => f.gid === "1213802028079845");
-  return statusField?.display_value || "Open";
+function getScope(task) {
+  const f = (task.custom_fields || []).find((f) => f.gid === "1213815702340197");
+  return f?.text_value || "General";
 }
 
-function getProgressUpdate(task) {
-  if (!task.custom_fields) return null;
-  const progressField = task.custom_fields.find((f) => f.gid === "1213802028079850");
-  return progressField?.text_value || null;
+function getProgress(task) {
+  const f = (task.custom_fields || []).find((f) => f.gid === "1213802028079850");
+  const val = f?.text_value;
+  if (!val) return null;
+  const lines = val.split("\n").filter(l =>
+    l.trim() && !l.includes("PROGRESS LOG") && !l.includes("[YYYY") && l.length > 5
+  );
+  const last = lines.reverse().find(l => l.length > 5);
+  return last ? last.trim().slice(0, 120) : null;
+}
+
+function getOwner(task) {
+  if (!task.assignee) return "⚠ Unassigned";
+  return OWNERS[task.assignee.gid]?.name || task.assignee.name || "Unknown";
 }
 
 // ─────────────────────────────────────────────
 // SLACK HELPERS
 // ─────────────────────────────────────────────
-async function slackPost(channel, text, blocks = null) {
+async function slackPost(channel, text, thread_ts = null) {
   const body = { channel, text };
-  if (blocks) body.blocks = blocks;
+  if (thread_ts) body.thread_ts = thread_ts;
   const res = await axios.post("https://slack.com/api/chat.postMessage", body, {
-    headers: {
-      Authorization: `Bearer ${SLACK_BOT_TOKEN}`,
-      "Content-Type": "application/json",
-    },
+    headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}`, "Content-Type": "application/json" },
   });
   if (!res.data.ok) console.error("Slack error:", res.data.error);
   return res.data;
@@ -103,14 +112,6 @@ async function slackGetHistory(channel, oldest) {
     params: { channel, oldest, limit: 50 },
   });
   return res.data.messages || [];
-}
-
-async function slackGetUserInfo(userId) {
-  const res = await axios.get("https://slack.com/api/users.info", {
-    headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
-    params: { user: userId },
-  });
-  return res.data.user;
 }
 
 // ─────────────────────────────────────────────
@@ -134,96 +135,207 @@ async function callClaude(prompt, system = "") {
 }
 
 // ─────────────────────────────────────────────
-// REPORT 1 — Executive summary to #portal-product-feedback
-// Every 2hrs Mon-Fri 8am–6pm AEST
+// BUILD MESSAGE 1 — EXEC SUMMARY (channel)
+// Clean, compact overview only
+// ─────────────────────────────────────────────
+function buildExecSummary(tasks, prevStatus, now) {
+  const byCategory = {};
+  let totalMoved = 0, unassigned = 0;
+
+  for (const task of tasks) {
+    const cat    = getScope(task);
+    const status = getBoardStatus(task);
+    const prev   = prevStatus[task.gid];
+    const moved  = prev && prev !== status;
+    if (moved) totalMoved++;
+    if (!task.assignee) unassigned++;
+    if (!byCategory[cat]) byCategory[cat] = { tasks: [], moved: 0, statuses: {} };
+    byCategory[cat].tasks.push(task);
+    byCategory[cat].statuses[status] = (byCategory[cat].statuses[status] || 0) + 1;
+    if (moved) byCategory[cat].moved++;
+  }
+
+  const lines = [
+    `📊 *Portal Stabilisation — ${now}*`,
+    `_Auto-generated every 2hrs · Mon–Fri 8am–6pm_`,
+    ``,
+    `*${tasks.length} open tasks · ${totalMoved} moved this period · ${unassigned} unassigned*`,
+    ``,
+    `*Category overview:*`,
+  ];
+
+  for (const [cat, data] of Object.entries(byCategory)) {
+    const statusStr = Object.entries(data.statuses)
+      .map(([s, n]) => `${STATUS_EMOJI[s]}${s}:${n}`)
+      .join(" · ");
+    const movedNote = data.moved > 0 ? ` *(${data.moved} moved)*` : "";
+    lines.push(`• *${cat}* (${data.tasks.length})${movedNote} — ${statusStr}`);
+  }
+
+  if (unassigned > 0) {
+    const unassignedNames = tasks
+      .filter(t => !t.assignee)
+      .map(t => t.name)
+      .join(" · ");
+    lines.push(``, `⚠️ *Unassigned:* ${unassignedNames}`);
+  }
+
+  lines.push(
+    ``,
+    `_Full details in thread ↓_`,
+    `📈 *Latest Progress Update* · 📋 *Full Report*`
+  );
+
+  return lines.join("\n");
+}
+
+// ─────────────────────────────────────────────
+// BUILD MESSAGE 2 — LATEST PROGRESS UPDATE (thread reply 1)
+// Only tasks with board moves or new progress logs
+// ─────────────────────────────────────────────
+function buildProgressUpdate(tasks, prevStatus, now) {
+  const updated = [];
+
+  for (const task of tasks) {
+    const status   = getBoardStatus(task);
+    const prev     = prevStatus[task.gid];
+    const moved    = prev && prev !== status;
+    const progress = getProgress(task);
+    if (moved || progress) {
+      updated.push({ task, status, prev, moved, progress });
+    }
+  }
+
+  const lines = [
+    `📈 *Latest Progress Update — ${now}*`,
+    `_Tasks with board moves or new progress logs since last report_`,
+    ``,
+  ];
+
+  if (updated.length === 0) {
+    lines.push(`_No updates since last report. Owners — please update your Progress Log and move cards on the Board._`);
+    return lines.join("\n");
+  }
+
+  for (const { task, status, prev, moved, progress } of updated) {
+    const emoji       = STATUS_EMOJI[status] || "⬜";
+    const statusLine  = moved
+      ? `📍 ${prev} → *${status}*`
+      : `📍 *${status}* _(no board move)_`;
+    const progressLine = progress
+      ? `💬 ${progress}`
+      : `💬 _No progress text yet_`;
+
+    lines.push(`${emoji} *${task.name}*`);
+    lines.push(`   👤 ${getOwner(task)}  |  ${statusLine}`);
+    lines.push(`   ${progressLine}`);
+    lines.push(`   📎 <${ASANA_TASK_URL(task.gid)}|Open task in Asana>`);
+    lines.push(``);
+  }
+
+  const silent = tasks.length - updated.length;
+  if (silent > 0) {
+    lines.push(`_${silent} task${silent > 1 ? "s" : ""} with no updates since last report_`);
+  }
+
+  return lines.join("\n");
+}
+
+// ─────────────────────────────────────────────
+// BUILD MESSAGE 3 — FULL REPORT (thread reply 2)
+// All tasks grouped by category
+// ─────────────────────────────────────────────
+function buildFullReport(tasks, prevStatus, now) {
+  const byCategory = {};
+  for (const task of tasks) {
+    const cat = getScope(task);
+    if (!byCategory[cat]) byCategory[cat] = [];
+    byCategory[cat].push(task);
+  }
+
+  const lines = [
+    `📋 *Full Report — all ${tasks.length} tasks · ${now}*`,
+    ``,
+  ];
+
+  for (const [cat, catTasks] of Object.entries(byCategory)) {
+    lines.push(`*━ ${cat.toUpperCase()} (${catTasks.length}) ━*`);
+
+    for (const task of catTasks) {
+      const status   = getBoardStatus(task);
+      const prev     = prevStatus[task.gid];
+      const moved    = prev && prev !== status;
+      const emoji    = STATUS_EMOJI[status] || "⬜";
+      const change   = moved
+        ? `${prev} → *${status}*`
+        : `${status} _(nc)_`;
+      const progress = getProgress(task) || "_No update_";
+
+      lines.push(`${emoji} *${task.name}*`);
+      lines.push(`   👤 ${getOwner(task)}  |  📍 ${change}`);
+      lines.push(`   💬 ${progress}`);
+      lines.push(`   📎 <${ASANA_TASK_URL(task.gid)}|Open & update in Asana>`);
+    }
+    lines.push(``);
+  }
+
+  lines.push(`_Auto-generated · Next report in 2hrs · Owner reminders sent separately_`);
+  return lines.join("\n");
+}
+
+// ─────────────────────────────────────────────
+// REPORT 1 — 3-message send
+// Mon–Fri 8am, 10am, 12pm, 2pm, 4pm, 6pm AEST
 // ─────────────────────────────────────────────
 async function sendExecutiveSummary() {
-  console.log(`[${new Date().toISOString()}] Sending executive summary...`);
+  console.log(`[${new Date().toISOString()}] Sending report...`);
   try {
     const tasks = await fetchAllTasks();
-
-    // Group by category
-    const byCategory = {};
-    let overdueCount = 0;
-    let unassignedCount = 0;
-    const testingTasks = [];
-    const overdueTasks = [];
-
-    for (const task of tasks) {
-      const cat = getTaskScope(task);
-      const status = getTaskStatus(task);
-      if (!byCategory[cat]) byCategory[cat] = [];
-      byCategory[cat].push({ ...task, _status: status });
-
-      if (!task.assignee) unassignedCount++;
-      if (status === "Overdue") { overdueCount++; overdueTasks.push(task.name); }
-      if (status === "Testing") testingTasks.push(task.name);
-    }
-
-    const now = new Date().toLocaleString("en-AU", {
-      timeZone: TZ, hour: "2-digit", minute: "2-digit",
-      weekday: "short", day: "numeric", month: "short",
+    const now   = new Date().toLocaleString("en-AU", {
+      timeZone: TZ, weekday: "short", day: "numeric",
+      month: "short", hour: "2-digit", minute: "2-digit",
     });
 
-    // Build category lines
-    const statusEmoji = { "Open": "🔵", "Testing": "🟡", "Development": "🟠", "Deployment": "🟣", "Overdue": "🔴", "Completed": "🟢" };
-    const catLines = Object.entries(byCategory).map(([cat, catTasks]) => {
-      const statuses = catTasks.map((t) => t._status);
-      const hasOverdue = statuses.includes("Overdue");
-      const allOpen = statuses.every((s) => s === "Open");
-      const icon = hasOverdue ? "🔴" : allOpen ? "🔵" : "🟡";
-      return `${icon} *${cat}* — ${catTasks.length} task${catTasks.length > 1 ? "s" : ""} · ${[...new Set(statuses)].join(", ")}`;
-    }).join("\n");
+    // Message 1 — exec summary to channel
+    const summaryMsg = await slackPost(CHANNEL_ID, buildExecSummary(tasks, previousStatus, now));
+    const threadTs   = summaryMsg.ts;
 
-    const overdueBlock = overdueCount > 0
-      ? `\n\n⚠️ *Overdue (${overdueCount}):* ${overdueTasks.map((n) => `_${n}_`).join(", ")}`
-      : "";
+    // Small delay so thread replies arrive in order
+    await new Promise(r => setTimeout(r, 800));
 
-    const unassignedBlock = unassignedCount > 0
-      ? `\n⚠️ *Unassigned tasks:* ${unassignedCount} need owners`
-      : "";
+    // Message 2 — Latest Progress Update (thread reply 1)
+    await slackPost(CHANNEL_ID, buildProgressUpdate(tasks, previousStatus, now), threadTs);
 
-    const testingBlock = testingTasks.length > 0
-      ? `\n🧪 *In Testing:* ${testingTasks.join(", ")}`
-      : "";
+    await new Promise(r => setTimeout(r, 500));
 
-    const message = [
-      `📊 *Portal Stabilisation — Status Report*`,
-      `_${now} · Auto-generated every 2hrs_`,
-      ``,
-      `*${tasks.length} open tasks across ${Object.keys(byCategory).length} categories*`,
-      ``,
-      catLines,
-      overdueBlock,
-      unassignedBlock,
-      testingBlock,
-      ``,
-      `_Full task details: <https://app.asana.com/0/${PROJECT_GID}|Open in Asana>_`,
-    ].join("\n");
+    // Message 3 — Full Report (thread reply 2)
+    await slackPost(CHANNEL_ID, buildFullReport(tasks, previousStatus, now), threadTs);
 
-    await slackPost(CHANNEL_ID, message);
-    console.log(`[${new Date().toISOString()}] Executive summary sent ✓`);
+    // Update status snapshot for next cycle
+    for (const task of tasks) {
+      previousStatus[task.gid] = getBoardStatus(task);
+    }
+
+    console.log(`[${new Date().toISOString()}] All 3 messages sent ✓ (channel + 2 thread replies)`);
   } catch (err) {
-    console.error("Executive summary error:", err.message);
+    console.error("Report error:", err.message);
   }
 }
 
 // ─────────────────────────────────────────────
-// REPORT 2 — Owner reminders via DM
-// Every 2hrs Mon-Fri 9:30am–5:30pm AEST
+// REPORT 2 — Owner DMs
+// Mon–Fri 9:30am, 11:30am, 1:30pm, 3:30pm, 5:30pm AEST
 // ─────────────────────────────────────────────
 async function sendOwnerReminders() {
   console.log(`[${new Date().toISOString()}] Sending owner reminders...`);
   try {
-    const tasks = await fetchAllTasks();
-
-    // Group tasks by owner Asana GID
+    const tasks   = await fetchAllTasks();
     const byOwner = {};
     for (const task of tasks) {
-      const assigneeGid = task.assignee?.gid;
-      if (!assigneeGid || !OWNERS[assigneeGid]) continue;
-      if (!byOwner[assigneeGid]) byOwner[assigneeGid] = [];
-      byOwner[assigneeGid].push(task);
+      const gid = task.assignee?.gid;
+      if (!gid || !OWNERS[gid]) continue;
+      if (!byOwner[gid]) byOwner[gid] = [];
+      byOwner[gid].push(task);
     }
 
     const now = new Date().toLocaleString("en-AU", {
@@ -234,31 +346,40 @@ async function sendOwnerReminders() {
       const owner = OWNERS[asanaGid];
 
       const taskLines = ownerTasks.map((t) => {
-        const status = getTaskStatus(t);
-        const progress = getProgressUpdate(t);
-        const statusEmoji = status === "Overdue" ? "🔴" : status === "Testing" ? "🟡" : "🔵";
-        const progressNote = progress
-          ? `\n   _Last update: ${progress.slice(0, 80)}${progress.length > 80 ? "…" : ""}_`
-          : `\n   _No progress update yet_`;
-        return `${statusEmoji} *${t.name}*${progressNote}\n   📎 <${ASANA_TASK_URL(t.gid)}|Open task in Asana>`;
+        const status   = getBoardStatus(t);
+        const prev     = previousStatus[t.gid];
+        const moved    = prev && prev !== status;
+        const progress = getProgress(t);
+
+        const statusLine = moved
+          ? `📍 ${prev} → *${status}* _(moved!)_`
+          : `📍 *${status}* — please move board card if this has changed`;
+        const progressLine = progress
+          ? `💬 Last: ${progress}`
+          : `💬 _No progress update yet — please add one_`;
+
+        return [
+          `${STATUS_EMOJI[status] || "⬜"} *${t.name}*`,
+          `   ${statusLine}`,
+          `   ${progressLine}`,
+          `   📎 <${ASANA_TASK_URL(t.gid)}|Update this task in Asana>`,
+        ].join("\n");
       }).join("\n\n");
 
-      const message = [
-        `⏰ *Reminder to update progress within 30 mins*`,
+      const msg = [
+        `⏰ *Reminder: Update your task progress within 30 mins*`,
         `_${now} · Portal Stabilisation_`,
         ``,
-        `Hi ${owner.name}! You have *${ownerTasks.length} open task${ownerTasks.length > 1 ? "s" : ""}* requiring a progress update:`,
+        `Hi ${owner.name}! You have *${ownerTasks.length} open task${ownerTasks.length > 1 ? "s" : ""}* needing a progress update:`,
         ``,
         taskLines,
         ``,
-        `Please update the *Progress Log* field in each task. Takes 30 seconds! 🙏`,
+        `*To update:* Click each task link → add a line to the *Progress Log* field → drag the card to the correct Board column if status has changed.`,
       ].join("\n");
 
-      await slackPost(owner.slack, message);
-      console.log(`[${new Date().toISOString()}] Reminder sent to ${owner.name} ✓`);
-
-      // Small delay between DMs
-      await new Promise((r) => setTimeout(r, 500));
+      await slackPost(owner.slack, msg);
+      console.log(`[${new Date().toISOString()}] Reminder → ${owner.name} ✓`);
+      await new Promise(r => setTimeout(r, 500));
     }
   } catch (err) {
     console.error("Owner reminder error:", err.message);
@@ -266,41 +387,34 @@ async function sendOwnerReminders() {
 }
 
 // ─────────────────────────────────────────────
-// AUTO-TASK CONVERTER
-// Polls #portal-product-feedback every 15 mins
-// Converts actionable posts by Dali or Pete to Asana tasks
+// AUTO-TASK CONVERTER — every 15 mins
+// Watches Dali & Pete posts → creates Asana tasks
 // ─────────────────────────────────────────────
 async function autoConvertSlackToTasks() {
-  console.log(`[${new Date().toISOString()}] Checking for new posts to convert...`);
+  console.log(`[${new Date().toISOString()}] Checking for new posts...`);
   try {
     const messages = await slackGetHistory(CHANNEL_ID, lastProcessedTs);
     if (!messages.length) return;
 
-    // Sort oldest first
     const sorted = [...messages].sort((a, b) => parseFloat(a.ts) - parseFloat(b.ts));
 
     for (const msg of sorted) {
       if (parseFloat(msg.ts) <= parseFloat(lastProcessedTs)) continue;
       lastProcessedTs = msg.ts;
 
-      // Only process messages from Dali or Pete
       const watchedUser = WATCH_USERS[msg.user];
       if (!watchedUser) continue;
-
-      // Skip if too short or just a greeting
       const text = (msg.text || "").trim();
-      if (text.length < 30) continue;
-      if (/^(hi|hello|hey|thanks|ok|yes|no)\b/i.test(text)) continue;
+      if (text.length < 30 || /^(hi|hello|hey|thanks|ok|yes|no)\b/i.test(text)) continue;
 
       console.log(`[${new Date().toISOString()}] Evaluating message from ${watchedUser}...`);
 
-      // Use Claude to decide if this is actionable and extract task details
       const analysis = await callClaude(
-        `Analyze this Slack message from ${watchedUser} and determine if it contains actionable feedback, bug reports, or feature requests that should become Asana tasks. If yes, extract the task details.
+        `Analyze this Slack message from ${watchedUser} and determine if it contains actionable feedback, bugs, or feature requests.
 
 Message: "${text}"
 
-Return ONLY valid JSON in this exact format (no markdown, no explanation):
+Return ONLY valid JSON:
 {
   "is_actionable": true or false,
   "reason": "brief reason",
@@ -308,46 +422,37 @@ Return ONLY valid JSON in this exact format (no markdown, no explanation):
     {
       "name": "Short task name (max 60 chars)",
       "description": "Full description of what needs to be done",
-      "category": "one of: Alerts & Intelligence | Voice | Bot Management | Portal UX & Performance | Operations & Targeting | Email | Reporting & Analytics",
+      "category": "Alerts & Intelligence | Voice | Bot Management | Portal UX & Performance | Operations & Targeting | Email | Reporting & Analytics",
       "suggested_assignee": "Pete or Saber or Mahit or Chayan or null"
     }
   ]
 }`,
-        "You are a project manager assistant. Extract actionable tasks from Slack messages. Return only valid JSON."
+        "You are a project manager. Extract actionable tasks from Slack messages. Return only valid JSON."
       );
 
       let parsed;
       try {
-        const clean = analysis.replace(/```json\n?|```\n?/g, "").trim();
-        parsed = JSON.parse(clean);
+        parsed = JSON.parse(analysis.replace(/```json\n?|```\n?/g, "").trim());
       } catch {
-        console.error("Failed to parse Claude response:", analysis);
-        continue;
+        console.error("Parse error"); continue;
       }
 
       if (!parsed.is_actionable || !parsed.tasks?.length) {
-        console.log(`Message from ${watchedUser} not actionable: ${parsed.reason}`);
-        continue;
+        console.log(`Not actionable: ${parsed.reason}`); continue;
       }
 
-      // Create Asana tasks
-      const createdTasks = [];
-      for (const taskDef of parsed.tasks) {
-        // Find assignee GID
-        const assigneeEntry = Object.entries(OWNERS).find(
-          ([, v]) => v.name === taskDef.suggested_assignee
-        );
-        const assigneeGid = assigneeEntry ? assigneeEntry[0] : null;
-
+      const created = [];
+      for (const td of parsed.tasks) {
+        const assigneeEntry = Object.entries(OWNERS).find(([, v]) => v.name === td.suggested_assignee);
         const task = await asanaPost("/tasks", {
-          name: taskDef.name,
+          name:  td.name,
           notes: [
             `━━━━━━━━━━━━━━━━━━━━━━`,
-            `CATEGORY: ${taskDef.category}`,
+            `CATEGORY: ${td.category}`,
             `━━━━━━━━━━━━━━━━━━━━━━`,
             ``,
             `DESCRIPTION`,
-            taskDef.description,
+            td.description,
             ``,
             `SOURCE: ${watchedUser} in #portal-product-feedback`,
             ``,
@@ -359,28 +464,23 @@ Return ONLY valid JSON in this exact format (no markdown, no explanation):
             `PROGRESS LOG (update every 2 hrs)`,
             `[YYYY-MM-DD HH:MM] — [Update here]`,
           ].join("\n"),
-          projects: [PROJECT_GID],
-          ...(assigneeGid && { assignee: assigneeGid }),
+          projects:    [PROJECT_GID],
+          memberships: [{ project: PROJECT_GID, section: "1213815704002761" }], // Planned
+          ...(assigneeEntry && { assignee: assigneeEntry[0] }),
         });
-
-        createdTasks.push({ ...task, category: taskDef.category });
-        console.log(`[${new Date().toISOString()}] Created task: "${taskDef.name}" ✓`);
+        created.push(task);
+        console.log(`[${new Date().toISOString()}] Created: "${td.name}" ✓`);
       }
 
-      // Post confirmation back to Slack thread
-      if (createdTasks.length > 0) {
-        const taskList = createdTasks.map(
-          (t) => `• <${ASANA_TASK_URL(t.gid)}|${t.name}>`
-        ).join("\n");
-
-        await slackPost(CHANNEL_ID,
-          `✅ *${createdTasks.length} Asana task${createdTasks.length > 1 ? "s" : ""} created from ${watchedUser}'s feedback:*\n${taskList}`,
-          null
+      if (created.length) {
+        await slackPost(
+          CHANNEL_ID,
+          `✅ *${created.length} task${created.length > 1 ? "s" : ""} auto-created from ${watchedUser}'s feedback:*\n` +
+          created.map(t => `• <${ASANA_TASK_URL(t.gid)}|${t.name}>`).join("\n") +
+          `\n_Added to "Planned" on the Board_`
         );
       }
-
-      // Small delay between messages
-      await new Promise((r) => setTimeout(r, 1000));
+      await new Promise(r => setTimeout(r, 1000));
     }
   } catch (err) {
     console.error("Auto-convert error:", err.message);
@@ -388,24 +488,22 @@ Return ONLY valid JSON in this exact format (no markdown, no explanation):
 }
 
 // ─────────────────────────────────────────────
-// STARTUP CHECK
+// STARTUP
 // ─────────────────────────────────────────────
 async function startupCheck() {
-  console.log("─────────────────────────────────────────");
-  console.log("  Portal Stabilisation Automation Server");
-  console.log("─────────────────────────────────────────");
-  console.log(`  Timezone : ${TZ}`);
-  console.log(`  Project  : ${PROJECT_GID}`);
-  console.log(`  Channel  : ${CHANNEL_ID}`);
+  console.log("─────────────────────────────────────────────────");
+  console.log("  Portal Stabilisation Automation v3");
+  console.log("─────────────────────────────────────────────────");
+  console.log(`  Board: Backlog → Prioritised → Planned → In Progress → Testing → Done`);
+  console.log(`  Channel structure: Exec summary on channel · 2 thread replies`);
   console.log("");
 
-  // Verify credentials
   try {
     const tasks = await fetchAllTasks();
-    console.log(`  ✓ Asana connected — ${tasks.length} open tasks found`);
+    for (const task of tasks) previousStatus[task.gid] = getBoardStatus(task);
+    console.log(`  ✓ Asana connected — ${tasks.length} tasks found, board status seeded`);
   } catch (e) {
-    console.error("  ✗ Asana connection failed:", e.message);
-    process.exit(1);
+    console.error("  ✗ Asana failed:", e.message); process.exit(1);
   }
 
   try {
@@ -414,48 +512,36 @@ async function startupCheck() {
     });
     console.log("  ✓ Slack connected");
   } catch (e) {
-    console.error("  ✗ Slack connection failed:", e.message);
-    process.exit(1);
+    console.error("  ✗ Slack failed:", e.message); process.exit(1);
   }
 
   console.log("  ✓ All systems go\n");
 
-  // Send startup notification
   await slackPost(
     CHANNEL_ID,
-    `🤖 *Portal Stabilisation Automation is now active*\n_Reporting every 2hrs Mon–Fri 8am–6pm · Owner reminders at 9:30am–5:30pm · Auto-task conversion from Dali & Pete posts enabled_`
+    `🤖 *Portal Stabilisation Automation v3 — Live*\n` +
+    `_Channel: Exec summary only · Thread: Latest Progress Update + Full Report_\n` +
+    `_Reports every 2hrs Mon–Fri 8am–6pm · Owner DMs 9:30am–5:30pm · Auto-task conversion active_`
   );
 }
 
 // ─────────────────────────────────────────────
-// CRON SCHEDULES (all times in Australia/Sydney)
-// ─────────────────────────────────────────────
-// Report 1: Mon-Fri 8am, 10am, 12pm, 2pm, 4pm, 6pm
-const REPORT_SCHEDULE = "0 8,10,12,14,16,18 * * 1-5";
-
-// Report 2 (reminders): Mon-Fri 9:30am, 11:30am, 1:30pm, 3:30pm, 5:30pm
-const REMINDER_SCHEDULE = "30 9,11,13,15,17 * * 1-5";
-
-// Auto-convert: every 15 minutes
-const AUTOCONVERT_SCHEDULE = "*/15 * * * *";
-
-// ─────────────────────────────────────────────
-// MAIN
+// SCHEDULES & MAIN
 // ─────────────────────────────────────────────
 (async () => {
   await startupCheck();
 
-  // Schedule Report 1 — Executive summary
-  cron.schedule(REPORT_SCHEDULE, sendExecutiveSummary, { timezone: TZ });
-  console.log(`📊 Report 1 scheduled: ${REPORT_SCHEDULE} (${TZ})`);
+  // Report: Mon–Fri 8am, 10am, 12pm, 2pm, 4pm, 6pm
+  cron.schedule("0 8,10,12,14,16,18 * * 1-5", sendExecutiveSummary, { timezone: TZ });
+  console.log("📊 Report scheduled: Mon–Fri 8am–6pm every 2hrs");
 
-  // Schedule Report 2 — Owner reminders
-  cron.schedule(REMINDER_SCHEDULE, sendOwnerReminders, { timezone: TZ });
-  console.log(`⏰ Report 2 scheduled: ${REMINDER_SCHEDULE} (${TZ})`);
+  // Owner reminders: Mon–Fri 9:30am, 11:30am, 1:30pm, 3:30pm, 5:30pm
+  cron.schedule("30 9,11,13,15,17 * * 1-5", sendOwnerReminders, { timezone: TZ });
+  console.log("⏰ Reminders scheduled: Mon–Fri 9:30am–5:30pm every 2hrs");
 
-  // Schedule Auto-converter
-  cron.schedule(AUTOCONVERT_SCHEDULE, autoConvertSlackToTasks);
-  console.log(`🔄 Auto-converter scheduled: every 15 mins`);
+  // Auto-converter: every 15 mins
+  cron.schedule("*/15 * * * *", autoConvertSlackToTasks);
+  console.log("🔄 Auto-converter: every 15 mins\n");
 
-  console.log("\n✅ All schedulers running. Press Ctrl+C to stop.\n");
+  console.log("✅ All schedulers running.\n");
 })();
