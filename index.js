@@ -21,21 +21,30 @@ const BOARD_SECTIONS = {
   "1213863123247951": "Testing",
   "1213863123247952": "Done",
 };
+const DONE_SECTION_GID       = "1213863123247952";
+const DEPLOYMENT_STATUS_GID  = "1213815710185880"; // Deployment enum option
+const COMPLETED_STATUS_GID   = "1213802028079846"; // Completed enum option
 
 const STATUS_EMOJI = {
   "Backlog": "⬜", "Prioritised": "🔷", "Planned": "🔵",
   "In Progress": "🟡", "Testing": "🟠", "Done": "🟢",
 };
 
-// Priority display
+// Priority display (emoji + label for thread reports, plain label for exec summary)
 const PRIORITY_EMOJI = { "High": "🔴", "Medium": "🟠", "Low": "🟡" };
 const PRIORITY_SORT  = { "High": 0, "Medium": 1, "Low": 2, "—": 3 };
 
+// Slack mrkdwn colour using bold for priority / status labels
+// (Block Kit doesn't support inline colour — we use bold text only)
+// Status colour legend used in exec summary Due Today list:
+// Priority:  High = bold only (readers know red = high from label)
+// Status: communicated via text label, no colour coding in mrkdwn
+
 const OWNERS = {
-  "1213776006274031": { name: "Pete",   slack: "U06MSUARQ77" },
-  "1213778917763529": { name: "Saber",  slack: "U09FT29J3LH" },
-  "1210457965895022": { name: "Mahit",  slack: "U07UXL3FX37" },
-  "1213779385519783": { name: "Chayan", slack: "U06S0T3UFFB" },
+  "1213776006274031": { name: "Pete",      slack: "U06MSUARQ77" },
+  "1213778917763529": { name: "Saber",     slack: "U09FT29J3LH" },
+  "1210457965895022": { name: "Mahit",     slack: "U07UXL3FX37" },
+  "1213779385519783": { name: "Chayan",    slack: "U06S0T3UFFB" },
 };
 
 const WATCH_USERS = { "U06LB8LJ50R": "Dali", "U06MSUARQ77": "Pete" };
@@ -47,20 +56,20 @@ let lastProcessedTs = (Date.now() / 1000 - 3600).toString();
 // DATE HELPERS
 // ─────────────────────────────────────────────
 function todayStr() {
-  return new Date().toLocaleDateString("en-CA", { timeZone: TZ });
+  return new Date().toLocaleDateString("en-CA", { timeZone: TZ }); // YYYY-MM-DD
 }
 
-function dueDateLabel(dueOn) {
+function dueDateStatus(dueOn) {
   if (!dueOn) return null;
-  const today = todayStr();
+  const today    = todayStr();
   const tomorrow = new Date(new Date().toLocaleString("en-US", { timeZone: TZ }));
   tomorrow.setDate(tomorrow.getDate() + 1);
   const tomorrowStr = tomorrow.toISOString().slice(0, 10);
 
-  if (dueOn < today)        return { label: `🔴 OVERDUE (${dueOn})`,  urgent: true,  overdue: true  };
-  if (dueOn === today)      return { label: `🚨 DUE TODAY`,            urgent: true,  overdue: false };
-  if (dueOn === tomorrowStr) return { label: `⚠️ Due tomorrow`,        urgent: false, overdue: false };
-  return                           { label: `📅 Due ${dueOn}`,         urgent: false, overdue: false };
+  if (dueOn < today)         return { type: "overdue",   label: `was due ${dueOn}` };
+  if (dueOn === today)       return { type: "today",     label: "Due Today" };
+  if (dueOn === tomorrowStr) return { type: "tomorrow",  label: "Due tomorrow" };
+  return                            { type: "future",    label: `Due ${dueOn}` };
 }
 
 // ─────────────────────────────────────────────
@@ -85,7 +94,7 @@ async function fetchAllTasks() {
     opt_fields: "gid,name,completed,assignee,assignee.name,custom_fields,notes,due_on,memberships,memberships.section,memberships.section.name,memberships.section.gid",
     limit: 100,
   });
-  return tasks.filter((t) => !t.completed);
+  return tasks; // include completed — we need them for closed count
 }
 
 function getBoardStatus(task) {
@@ -94,21 +103,41 @@ function getBoardStatus(task) {
   return m ? BOARD_SECTIONS[m.section.gid] : "Backlog";
 }
 
+function getBoardSectionGid(task) {
+  if (!task.memberships?.length) return null;
+  const m = task.memberships.find((m) => m.section && BOARD_SECTIONS[m.section.gid]);
+  return m ? m.section.gid : null;
+}
+
+function getStatusFieldGid(task) {
+  const f = (task.custom_fields || []).find((f) => f.gid === "1213802028079845");
+  return f?.enum_value?.gid || null;
+}
+
+// Closed = Done section OR status field = Deployment OR Completed
+function isClosed(task) {
+  const sectionGid = getBoardSectionGid(task);
+  const statusGid  = getStatusFieldGid(task);
+  return (
+    sectionGid === DONE_SECTION_GID ||
+    statusGid  === DEPLOYMENT_STATUS_GID ||
+    statusGid  === COMPLETED_STATUS_GID
+  );
+}
+
 function getScope(task) {
   const f = (task.custom_fields || []).find((f) => f.gid === "1213815702340197");
   return f?.text_value || "General";
 }
 
 function getPriority(task) {
-  // Try the project-level priority field first (GID: 1135564385376580)
   const f = (task.custom_fields || []).find((f) => f.gid === "1135564385376580");
   return f?.display_value || f?.enum_value?.name || "—";
 }
 
 function getPriorityDisplay(task) {
   const p = getPriority(task);
-  const emoji = PRIORITY_EMOJI[p] || "⚪";
-  return `${emoji} ${p}`;
+  return `${PRIORITY_EMOJI[p] || "⚪"} ${p}`;
 }
 
 function getProgress(task) {
@@ -149,7 +178,7 @@ async function slackGetHistory(channel, oldest) {
   return res.data.messages || [];
 }
 
-// Block Kit helpers
+// Block Kit builders
 function bkHeader(text)    { return { type: "header", text: { type: "plain_text", text, emoji: true } }; }
 function bkSection(mrkdwn) { return { type: "section", text: { type: "mrkdwn", text: mrkdwn } }; }
 function bkFields(fields)  { return { type: "section", fields: fields.map(f => ({ type: "mrkdwn", text: f })) }; }
@@ -169,33 +198,46 @@ async function callClaude(prompt, system = "") {
 }
 
 // ─────────────────────────────────────────────
+// DUE TODAY / OVERDUE ROW FORMAT
+// Priority (colour label) · Task name · Owner · Status
+// No emoji on owner or status fields
+// ─────────────────────────────────────────────
+function formatDueRow(task, includeWasDue = false) {
+  const priority = getPriority(task);
+  const status   = getBoardStatus(task);
+  const owner    = getOwner(task);
+  // Priority label styled with bold
+  const pLabel   = `*${priority}*`;
+  const dueStr   = includeWasDue && task.due_on ? `  _was due ${task.due_on}_` : "";
+  return `• ${pLabel}   ${task.name} · ${owner} · ${status}${dueStr}`;
+}
+
+// ─────────────────────────────────────────────
 // MESSAGE 1 — EXEC SUMMARY (channel, Block Kit)
 // ─────────────────────────────────────────────
-function buildExecSummaryBlocks(tasks, prevStatus, now) {
-  const byCategory = {};
-  let totalMoved = 0, unassigned = 0;
-  const dueTodayList = [], overdueList = [];
-  let highCount = 0, medCount = 0, lowCount = 0;
+function buildExecSummaryBlocks(allTasks, prevStatus, now) {
+  const openTasks    = allTasks.filter(t => !isClosed(t) && !t.completed);
+  const closedTasks  = allTasks.filter(t => isClosed(t));
+  const totalTasks   = allTasks.filter(t => !t.completed); // excludes Asana-completed
 
-  for (const task of tasks) {
-    const cat      = getScope(task);
-    const status   = getBoardStatus(task);
-    const priority = getPriority(task);
-    const prev     = prevStatus[task.gid];
-    const moved    = prev && prev !== status;
-    if (moved) totalMoved++;
-    if (!task.assignee) unassigned++;
-    if (priority === "High")   highCount++;
-    if (priority === "Medium") medCount++;
-    if (priority === "Low")    lowCount++;
-    if (!byCategory[cat]) byCategory[cat] = { tasks: [], moved: 0, statuses: {} };
-    byCategory[cat].tasks.push(task);
-    byCategory[cat].statuses[status] = (byCategory[cat].statuses[status] || 0) + 1;
-    if (moved) byCategory[cat].moved++;
+  let statusChanged = 0, highCount = 0;
+  const dueTodayList = [], overdueList = [];
+  const today = todayStr();
+
+  // Category breakdown (open tasks only)
+  const byCategory = {};
+  for (const task of openTasks) {
+    const cat    = getScope(task);
+    const status = getBoardStatus(task);
+    const prev   = prevStatus[task.gid];
+    if (prev && prev !== status) statusChanged++;
+    if (getPriority(task) === "High") highCount++;
+    if (!byCategory[cat]) byCategory[cat] = {};
+    byCategory[cat][status] = (byCategory[cat][status] || 0) + 1;
+
     if (task.due_on) {
-      const dl = dueDateLabel(task.due_on);
-      if (dl?.overdue) overdueList.push(task);
-      else if (dl?.label?.includes("TODAY")) dueTodayList.push(task);
+      if (task.due_on < today) overdueList.push(task);
+      else if (task.due_on === today) dueTodayList.push(task);
     }
   }
 
@@ -204,56 +246,47 @@ function buildExecSummaryBlocks(tasks, prevStatus, now) {
   blocks.push(bkContext(`_Auto-generated every 2hrs · Mon–Fri 8am–6pm_`));
   blocks.push(bkDivider());
 
-  // Stats — 6 fields
+  // ── 6 stat tiles ──
   blocks.push(bkFields([
-    `*Open Tasks*\n${tasks.length}`,
-    `*Moved This Period*\n${totalMoved > 0 ? `✅ ${totalMoved}` : "—"}`,
-    `*Unassigned*\n${unassigned > 0 ? `⚠️ ${unassigned}` : "✅ 0"}`,
-    `*Due Today*\n${dueTodayList.length > 0 ? `🚨 ${dueTodayList.length}` : "—"}`,
-    `*Priority: High*\n${highCount > 0 ? `🔴 ${highCount}` : "—"}`,
-    `*Priority: Med/Low*\n🟠 ${medCount}  🟡 ${lowCount}`,
+    `*Total Tasks*\n${totalTasks.length}`,
+    `*Open Tasks*\n${openTasks.length}`,
+    `*Closed Tasks*\n${closedTasks.length}`,
+    `*High Priority*\n${highCount}`,
+    `*Due Today*\n${dueTodayList.length > 0 ? dueTodayList.length : "—"}`,
+    `*Status Changed*\n${statusChanged > 0 ? statusChanged : "—"}`,
   ]));
   blocks.push(bkDivider());
 
-  // Overdue / due today
-  if (overdueList.length > 0) {
-    const names = overdueList.map(t => {
-      const status = getBoardStatus(t);
-      return `• ${getPriorityDisplay(t)}  *${t.name}* · 👤 ${getOwner(t)} · ${STATUS_EMOJI[status] || "⬜"} ${status} — was due ${t.due_on}`;
-    }).join("\n");
-    blocks.push(bkSection(`🔴 *OVERDUE (${overdueList.length}):*\n${names}`));
-    blocks.push(bkDivider());
-  }
+  // ── Due Today ──
   if (dueTodayList.length > 0) {
-    const names = dueTodayList.map(t => {
-      const status = getBoardStatus(t);
-      return `• ${getPriorityDisplay(t)}  *${t.name}* · 👤 ${getOwner(t)} · ${STATUS_EMOJI[status] || "⬜"} ${status}`;
-    }).join("\n");
-    blocks.push(bkSection(`🚨 *DUE TODAY (${dueTodayList.length}):*\n${names}`));
+    const rows = dueTodayList.map(t => formatDueRow(t)).join("\n");
+    blocks.push(bkSection(`*🚨 Due Today (${dueTodayList.length}):*\n${rows}`));
     blocks.push(bkDivider());
   }
 
-  // Category overview
-  blocks.push(bkSection("*Category Overview:*"));
-  for (const [cat, data] of Object.entries(byCategory)) {
-    const statusStr = Object.entries(data.statuses)
-      .map(([s, n]) => `${STATUS_EMOJI[s]} ${s}: ${n}`)
-      .join("  ·  ");
-    const movedNote = data.moved > 0 ? `  ✅ _${data.moved} moved_` : "";
-
-    // Priority breakdown for this category
-    const catHigh = data.tasks.filter(t => getPriority(t) === "High").length;
-    const catMed  = data.tasks.filter(t => getPriority(t) === "Medium").length;
-    const priorityNote = catHigh > 0 ? `  🔴 ${catHigh} high` : "";
-
-    blocks.push(bkSection(
-      `*${cat}* (${data.tasks.length})${movedNote}${priorityNote}\n${statusStr}`
-    ));
+  // ── Overdue — only rendered if tasks genuinely overdue (live data only) ──
+  if (overdueList.length > 0) {
+    const rows = overdueList.map(t => formatDueRow(t, true)).join("\n");
+    blocks.push(bkSection(`*🔴 Overdue (${overdueList.length}):*\n${rows}`));
+    blocks.push(bkDivider());
   }
-  blocks.push(bkDivider());
-  blocks.push(bkSection("_Full details in thread below ↓_\n📈 *Latest Progress Update*  ·  📋 *Full Report*"));
 
-  const fallback = `📊 Portal Stabilisation — ${now} | ${tasks.length} open · ${totalMoved} moved · ${unassigned} unassigned · 🔴 ${highCount} high priority${dueTodayList.length > 0 ? ` · 🚨 ${dueTodayList.length} due today` : ""}`;
+  // ── Category Overview ──
+  blocks.push(bkSection("*🗂 Category Overview:*"));
+  const catLines = Object.entries(byCategory).map(([cat, statuses]) => {
+    const breakdown = Object.entries(statuses)
+      .map(([s, n]) => `${s}:${n}`)
+      .join(" · ");
+    const total = Object.values(statuses).reduce((a, b) => a + b, 0);
+    return `• *${cat}* (${total}) — ${breakdown}`;
+  }).join("\n");
+  blocks.push(bkSection(catLines));
+  blocks.push(bkDivider());
+
+  // ── Thread links ──
+  blocks.push(bkSection("_Full details in thread below ↓_\n*📈 Latest Progress Update  ·  📋 Full Report*"));
+
+  const fallback = `📊 Portal Stabilisation — ${now} | Total:${totalTasks.length} Open:${openTasks.length} Closed:${closedTasks.length} High:${highCount}${dueTodayList.length > 0 ? ` 🚨 Due Today:${dueTodayList.length}` : ""}${overdueList.length > 0 ? ` 🔴 Overdue:${overdueList.length}` : ""}`;
   return { blocks, fallback };
 }
 
@@ -261,19 +294,21 @@ function buildExecSummaryBlocks(tasks, prevStatus, now) {
 // MESSAGE 2 — LATEST PROGRESS UPDATE (thread reply 1)
 // ─────────────────────────────────────────────
 function buildProgressUpdateBlocks(tasks, prevStatus, now) {
+  const openTasks = tasks.filter(t => !isClosed(t) && !t.completed);
   const updated = [];
-  for (const task of tasks) {
+
+  for (const task of openTasks) {
     const status   = getBoardStatus(task);
     const prev     = prevStatus[task.gid];
     const moved    = prev && prev !== status;
     const progress = getProgress(task);
-    const dl       = task.due_on ? dueDateLabel(task.due_on) : null;
-    if (moved || progress || dl?.urgent) {
-      updated.push({ task, status, prev, moved, progress, dl });
+    const ds       = task.due_on ? dueDateStatus(task.due_on) : null;
+    if (moved || progress || ds?.type === "overdue" || ds?.type === "today") {
+      updated.push({ task, status, prev, moved, progress, ds });
     }
   }
 
-  // Sort by priority within updated list
+  // Sort by priority
   updated.sort((a, b) =>
     (PRIORITY_SORT[getPriority(a.task)] || 3) - (PRIORITY_SORT[getPriority(b.task)] || 3)
   );
@@ -288,12 +323,12 @@ function buildProgressUpdateBlocks(tasks, prevStatus, now) {
     return { blocks, fallback: `📈 Latest Progress Update — No updates since last report.` };
   }
 
-  for (const { task, status, prev, moved, progress, dl } of updated) {
-    const emoji      = STATUS_EMOJI[status] || "⬜";
-    const priority   = getPriorityDisplay(task);
-    const statusLine = moved ? `${prev} → *${status}*` : `*${status}* _(no board move)_`;
+  for (const { task, status, prev, moved, progress, ds } of updated) {
+    const emoji    = STATUS_EMOJI[status] || "⬜";
+    const priority = getPriorityDisplay(task);
+    const statusLine = moved ? `${prev} → *${status}*` : `*${status}* _(no change)_`;
     const progLine   = progress || "_No progress text yet_";
-    const dueText    = dl ? `  ${dl.label}` : "";
+    const dueText    = ds ? `  _${ds.label}_` : "";
 
     blocks.push(bkSection(
       `${emoji} *${task.name}*\n` +
@@ -304,7 +339,7 @@ function buildProgressUpdateBlocks(tasks, prevStatus, now) {
     blocks.push(bkDivider());
   }
 
-  const silent = tasks.length - updated.length;
+  const silent = openTasks.length - updated.length;
   if (silent > 0) blocks.push(bkContext(`_${silent} task${silent > 1 ? "s" : ""} with no new updates_`));
 
   return { blocks, fallback: `📈 Latest Progress Update — ${updated.length} task${updated.length > 1 ? "s" : ""} updated.` };
@@ -314,14 +349,15 @@ function buildProgressUpdateBlocks(tasks, prevStatus, now) {
 // MESSAGE 3 — FULL REPORT (thread reply 2)
 // ─────────────────────────────────────────────
 function buildFullReportBlocks(tasks, prevStatus, now) {
+  const openTasks = tasks.filter(t => !isClosed(t) && !t.completed);
   const byCategory = {};
-  for (const task of tasks) {
+  for (const task of openTasks) {
     const cat = getScope(task);
     if (!byCategory[cat]) byCategory[cat] = [];
     byCategory[cat].push(task);
   }
 
-  // Sort tasks within each category by priority
+  // Sort within each category by priority
   for (const cat of Object.keys(byCategory)) {
     byCategory[cat].sort((a, b) =>
       (PRIORITY_SORT[getPriority(a)] || 3) - (PRIORITY_SORT[getPriority(b)] || 3)
@@ -329,15 +365,12 @@ function buildFullReportBlocks(tasks, prevStatus, now) {
   }
 
   const blocks = [];
-  blocks.push(bkHeader(`📋 Full Report — all ${tasks.length} tasks · ${now}`));
+  blocks.push(bkHeader(`📋 Full Report — ${openTasks.length} open tasks · ${now}`));
   blocks.push(bkContext(`_Sorted by priority within each category · High → Medium → Low_`));
   blocks.push(bkDivider());
 
   for (const [cat, catTasks] of Object.entries(byCategory)) {
-    const highCount = catTasks.filter(t => getPriority(t) === "High").length;
-    const priorityNote = highCount > 0 ? `  🔴 ${highCount} high` : "";
-    blocks.push(bkSection(`*━ ${cat.toUpperCase()} (${catTasks.length})${priorityNote} ━*`));
-
+    blocks.push(bkSection(`*━ ${cat.toUpperCase()} (${catTasks.length}) ━*`));
     for (const task of catTasks) {
       const status   = getBoardStatus(task);
       const prev     = prevStatus[task.gid];
@@ -346,12 +379,14 @@ function buildFullReportBlocks(tasks, prevStatus, now) {
       const priority = getPriorityDisplay(task);
       const change   = moved ? `${prev} → *${status}*` : `${status} _(nc)_`;
       const progress = getProgress(task) || "_No update_";
-      const dl       = task.due_on ? dueDateLabel(task.due_on) : null;
-      const dueStr   = dl ? `  ${dl.label}` : (task.due_on ? `  📅 Due ${task.due_on}` : "  📅 No due date");
+      const ds       = task.due_on ? dueDateStatus(task.due_on) : null;
+      const dueStr   = ds
+        ? (ds.type === "overdue" ? `  _🔴 ${ds.label}_` : ds.type === "today" ? `  _🚨 Due Today_` : `  _📅 ${ds.label}_`)
+        : `  _📅 No due date_`;
 
       blocks.push(bkSection(
-        `${emoji} *${task.name}*\n` +
-        `${priority}  |  👤 ${getOwner(task)}  |  📍 ${change}${dueStr}\n` +
+        `${emoji} *${task.name}*${dueStr}\n` +
+        `${priority}  |  👤 ${getOwner(task)}  |  📍 ${change}\n` +
         `💬 ${progress}\n` +
         `📎 <${ASANA_TASK_URL(task.gid)}|Open & update in Asana>`
       ));
@@ -362,7 +397,7 @@ function buildFullReportBlocks(tasks, prevStatus, now) {
   blocks.push(bkContext(`_Auto-generated · Next report in 2hrs · Owner reminders sent separately_`));
   return {
     blocks,
-    fallback: `📋 Full Report — ${tasks.length} open tasks across ${Object.keys(byCategory).length} categories.`,
+    fallback: `📋 Full Report — ${openTasks.length} open tasks across ${Object.keys(byCategory).length} categories.`,
   };
 }
 
@@ -373,27 +408,36 @@ function buildFullReportBlocks(tasks, prevStatus, now) {
 async function sendExecutiveSummary() {
   console.log(`[${new Date().toISOString()}] Sending report...`);
   try {
-    const tasks = await fetchAllTasks();
-    const now   = new Date().toLocaleString("en-AU", {
+    const allTasks = await fetchAllTasks();
+    const now = new Date().toLocaleString("en-AU", {
       timeZone: TZ, weekday: "short", day: "numeric",
       month: "short", hour: "2-digit", minute: "2-digit",
     });
 
-    const { blocks: b1, fallback: f1 } = buildExecSummaryBlocks(tasks, previousStatus, now);
+    // Message 1 — exec summary to channel
+    const { blocks: b1, fallback: f1 } = buildExecSummaryBlocks(allTasks, previousStatus, now);
     const summaryMsg = await slackPost(CHANNEL_ID, f1, b1);
     const threadTs   = summaryMsg.ts;
 
     await new Promise(r => setTimeout(r, 800));
 
-    const { blocks: b2, fallback: f2 } = buildProgressUpdateBlocks(tasks, previousStatus, now);
+    // Message 2 — Latest Progress Update (thread reply 1)
+    const { blocks: b2, fallback: f2 } = buildProgressUpdateBlocks(allTasks, previousStatus, now);
     await slackPost(CHANNEL_ID, f2, b2, threadTs);
 
     await new Promise(r => setTimeout(r, 500));
 
-    const { blocks: b3, fallback: f3 } = buildFullReportBlocks(tasks, previousStatus, now);
+    // Message 3 — Full Report (thread reply 2)
+    const { blocks: b3, fallback: f3 } = buildFullReportBlocks(allTasks, previousStatus, now);
     await slackPost(CHANNEL_ID, f3, b3, threadTs);
 
-    for (const task of tasks) previousStatus[task.gid] = getBoardStatus(task);
+    // Update snapshot (open non-closed tasks only)
+    for (const task of allTasks) {
+      if (!isClosed(task) && !task.completed) {
+        previousStatus[task.gid] = getBoardStatus(task);
+      }
+    }
+
     console.log(`[${new Date().toISOString()}] All 3 messages sent ✓`);
   } catch (err) {
     console.error("Report error:", err.message);
@@ -401,15 +445,16 @@ async function sendExecutiveSummary() {
 }
 
 // ─────────────────────────────────────────────
-// OWNER DMs — with priority + due date
+// OWNER DMs — priority + due date highlighting
 // Mon–Fri 9:30am, 11:30am, 1:30pm, 3:30pm, 5:30pm AEST
 // ─────────────────────────────────────────────
 async function sendOwnerReminders() {
   console.log(`[${new Date().toISOString()}] Sending owner reminders...`);
   try {
-    const tasks   = await fetchAllTasks();
-    const byOwner = {};
-    for (const task of tasks) {
+    const allTasks = await fetchAllTasks();
+    const openTasks = allTasks.filter(t => !isClosed(t) && !t.completed);
+    const byOwner   = {};
+    for (const task of openTasks) {
       const gid = task.assignee?.gid;
       if (!gid || !OWNERS[gid]) continue;
       if (!byOwner[gid]) byOwner[gid] = [];
@@ -419,34 +464,33 @@ async function sendOwnerReminders() {
     const now = new Date().toLocaleString("en-AU", {
       timeZone: TZ, hour: "2-digit", minute: "2-digit",
     });
+    const today = todayStr();
 
     for (const [asanaGid, ownerTasks] of Object.entries(byOwner)) {
       const owner = OWNERS[asanaGid];
 
-      // Sort: overdue → due today → high priority → medium → low → no date
+      // Sort: overdue → due today → high priority → medium → low
       const sorted = [...ownerTasks].sort((a, b) => {
-        const today = todayStr();
-        const aUrgent = a.due_on && a.due_on <= today ? 0 : (PRIORITY_SORT[getPriority(a)] || 3) + 1;
-        const bUrgent = b.due_on && b.due_on <= today ? 0 : (PRIORITY_SORT[getPriority(b)] || 3) + 1;
-        return aUrgent - bUrgent;
+        const aScore = a.due_on && a.due_on <= today ? 0 : (PRIORITY_SORT[getPriority(a)] || 3) + 1;
+        const bScore = b.due_on && b.due_on <= today ? 0 : (PRIORITY_SORT[getPriority(b)] || 3) + 1;
+        return aScore - bScore;
       });
 
       const blocks = [];
       blocks.push(bkHeader(`⏰ Reminder: Update your progress within 30 mins`));
       blocks.push(bkContext(`_${now} · Portal Stabilisation_`));
-      blocks.push(bkSection(
-        `Hi ${owner.name}! You have *${sorted.length} open task${sorted.length > 1 ? "s" : ""}* needing a progress update:`
-      ));
+      blocks.push(bkSection(`Hi ${owner.name}! You have *${sorted.length} open task${sorted.length > 1 ? "s" : ""}* needing a progress update:`));
       blocks.push(bkDivider());
 
-      // Urgent section — overdue or due today
-      const urgent = sorted.filter(t => t.due_on && t.due_on <= todayStr());
+      // Urgent block — overdue or due today
+      const urgent = sorted.filter(t => t.due_on && t.due_on <= today);
       if (urgent.length > 0) {
         const urgentLines = urgent.map(t => {
-          const dl = dueDateLabel(t.due_on);
-          return `${dl.label}  ${getPriorityDisplay(t)}  *${t.name}*\n  📎 <${ASANA_TASK_URL(t.gid)}|Update now>`;
+          const ds = dueDateStatus(t.due_on);
+          const label = ds?.type === "overdue" ? `🔴 ${ds.label}` : "🚨 Due Today";
+          return `${label}  *${getPriority(t)}*  *${t.name}*\n  📎 <${ASANA_TASK_URL(t.gid)}|Update now>`;
         }).join("\n\n");
-        blocks.push(bkSection(`*🚨 Urgent — Due Today or Overdue:*\n${urgentLines}`));
+        blocks.push(bkSection(`*Urgent — Due Today or Overdue:*\n${urgentLines}`));
         blocks.push(bkDivider());
       }
 
@@ -456,7 +500,7 @@ async function sendOwnerReminders() {
         const prev     = previousStatus[task.gid];
         const moved    = prev && prev !== status;
         const progress = getProgress(task);
-        const dl       = task.due_on ? dueDateLabel(task.due_on) : null;
+        const ds       = task.due_on ? dueDateStatus(task.due_on) : null;
         const priority = getPriorityDisplay(task);
 
         const statusLine = moved
@@ -465,11 +509,13 @@ async function sendOwnerReminders() {
         const progLine = progress
           ? `💬 Last: ${progress}`
           : `💬 _No progress update yet — please add one_`;
-        const dueLine = dl ? `  ${dl.label}` : (task.due_on ? `  📅 Due ${task.due_on}` : "  📅 _No due date set_");
+        const dueText = ds
+          ? (ds.type === "overdue" ? `  _🔴 ${ds.label}_` : ds.type === "today" ? `  _🚨 Due Today_` : ds.type === "tomorrow" ? `  _⚠️ Due tomorrow_` : `  _📅 ${ds.label}_`)
+          : `  _📅 No due date set_`;
 
         blocks.push(bkSection(
           `${STATUS_EMOJI[status] || "⬜"} *${task.name}*\n` +
-          `${priority}${dueLine}\n` +
+          `${priority}${dueText}\n` +
           `${statusLine}\n` +
           `${progLine}\n` +
           `📎 <${ASANA_TASK_URL(task.gid)}|Update this task in Asana>`
@@ -477,9 +523,7 @@ async function sendOwnerReminders() {
       }
 
       blocks.push(bkDivider());
-      blocks.push(bkSection(
-        "*To update:* Click each task link → add a line to the *Progress Log* field → drag the card to the correct Board column if status has changed."
-      ));
+      blocks.push(bkSection("*To update:* Click each task link → add a line to the *Progress Log* field → drag the card to the correct Board column if status has changed."));
 
       const fallback = `⏰ Reminder: You have ${sorted.length} open task${sorted.length > 1 ? "s" : ""} in Portal Stabilisation. Please update your progress within 30 mins.`;
       await slackPost(owner.slack, fallback, blocks);
@@ -493,6 +537,7 @@ async function sendOwnerReminders() {
 
 // ─────────────────────────────────────────────
 // AUTO-TASK CONVERTER — every 15 mins
+// Watches Dali & Pete posts → creates Asana tasks
 // ─────────────────────────────────────────────
 async function autoConvertSlackToTasks() {
   console.log(`[${new Date().toISOString()}] Checking for new posts...`);
@@ -520,18 +565,17 @@ async function autoConvertSlackToTasks() {
       catch { continue; }
       if (!parsed.is_actionable || !parsed.tasks?.length) continue;
 
-      // Priority GID map
       const PRIORITY_GIDS = { "High": "1135564385376581", "Medium": "1135564385376582", "Low": "1135564385376583" };
-
       const created = [];
+
       for (const td of parsed.tasks) {
         const assigneeEntry = Object.entries(OWNERS).find(([, v]) => v.name === td.suggested_assignee);
-        const priorityGid  = PRIORITY_GIDS[td.priority];
+        const priorityGid   = PRIORITY_GIDS[td.priority];
         const task = await asanaPost("/tasks", {
           name:  td.name,
           notes: `━━━━━━━━━━━━━━━━━━━━━━\nCATEGORY: ${td.category}\n━━━━━━━━━━━━━━━━━━━━━━\n\nDESCRIPTION\n${td.description}\n\nSOURCE: ${watchedUser} in #portal-product-feedback\n\n━━━━━━━━━━━━━━━━━━━━━━\nSOLUTION\n[Owner to complete]\n\n━━━━━━━━━━━━━━━━━━━━━━\nPROGRESS LOG (update every 2 hrs)\n[YYYY-MM-DD HH:MM] — [Update here]`,
-          projects:    [PROJECT_GID],
-          memberships: [{ project: PROJECT_GID, section: "1213815704002761" }],
+          projects:      [PROJECT_GID],
+          memberships:   [{ project: PROJECT_GID, section: "1213815704002761" }],
           custom_fields: priorityGid ? { "1135564385376580": priorityGid } : {},
           ...(assigneeEntry && { assignee: assigneeEntry[0] }),
         });
@@ -562,15 +606,17 @@ async function autoConvertSlackToTasks() {
 // ─────────────────────────────────────────────
 async function startupCheck() {
   console.log("─────────────────────────────────────────────────");
-  console.log("  Portal Stabilisation Automation v5");
-  console.log("  Block Kit · Due Dates · Priority · Board Status");
+  console.log("  Portal Stabilisation Automation v6");
+  console.log("  Closed = Done | Deployment | Completed");
+  console.log("  Exec summary: 6 tiles · Due Today · Overdue (live) · Category Overview");
   console.log("─────────────────────────────────────────────────");
 
   try {
-    const tasks = await fetchAllTasks();
-    for (const task of tasks) previousStatus[task.gid] = getBoardStatus(task);
-    const high = tasks.filter(t => getPriority(t) === "High").length;
-    console.log(`  ✓ Asana — ${tasks.length} tasks (${high} high priority), board seeded`);
+    const allTasks   = await fetchAllTasks();
+    const openTasks  = allTasks.filter(t => !isClosed(t) && !t.completed);
+    const closed     = allTasks.filter(t => isClosed(t));
+    for (const task of openTasks) previousStatus[task.gid] = getBoardStatus(task);
+    console.log(`  ✓ Asana — ${allTasks.length} total, ${openTasks.length} open, ${closed.length} closed — board seeded`);
   } catch (e) { console.error("  ✗ Asana:", e.message); process.exit(1); }
 
   try {
@@ -581,10 +627,10 @@ async function startupCheck() {
   console.log("  ✓ All systems go\n");
 
   await slackPost(CHANNEL_ID,
-    "Portal Stabilisation Automation v5 is live.",
+    "Portal Stabilisation Automation v6 is live.",
     [
-      bkHeader("🤖 Portal Stabilisation Automation v5 — Live"),
-      bkSection("*Block Kit UI · Priority tracking · Due date alerts · Board status*"),
+      bkHeader("🤖 Portal Stabilisation Automation v6 — Live"),
+      bkSection("*Exec summary: 6 tiles · Due Today & Overdue (live only) · 🗂 Category Overview*\n*Closed = Done section OR Deployment/Completed status*"),
       bkFields([
         "*Reports*\nEvery 2hrs · Mon–Fri 8am–6pm",
         "*Owner DMs*\nEvery 2hrs · 9:30am–5:30pm",
