@@ -1276,7 +1276,7 @@ async function buildOnDemandReport(userId) {
     blocks.push(bkDivider());
   }
 
-  blocks.push(bkContext("_Type /report in #project-update any time for a fresh copy_"));
+  blocks.push(bkContext("_Type !report in #project-update any time for a fresh copy_"));
   return { blocks, fallback: `⚡ On-demand Report · ${now}` };
 }
 
@@ -1303,7 +1303,12 @@ async function pollForReportCommand() {
       console.log(`[${new Date().toISOString()}] /report → DM to ${msg.user} ✓`);
     }
   } catch (err) {
-    console.error("Report command poll error:", err.message);
+    // Detailed logging so Railway shows what failed
+    if (err.message.includes("channel_not_found")) {
+      console.error(`[POLL] Cannot read #project-update — bot not in channel. Invite the bot manually: /invite @PortalBot in #project-update`);
+    } else {
+      console.error("Report command poll error:", err.message);
+    }
   }
 }
 
@@ -1451,10 +1456,26 @@ async function sendUnassignedAlert() {
 // ─────────────────────────────────────────────
 // STARTUP
 // ─────────────────────────────────────────────
+async function joinChannel(channelId) {
+  try {
+    const res = await axios.post("https://slack.com/api/conversations.join",
+      { channel: channelId },
+      { headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}`, "Content-Type": "application/json" } }
+    );
+    if (res.data.ok || res.data.error === "already_in_channel") {
+      console.log(`  ✓ Channel ${channelId} — joined/confirmed`);
+    } else {
+      console.warn(`  ⚠ Cannot join ${channelId}: ${res.data.error} — private channel needs manual /invite`);
+    }
+  } catch (err) {
+    console.warn(`  ⚠ Channel join error ${channelId}: ${err.message}`);
+  }
+}
+
 async function startupCheck() {
   console.log("═════════════════════════════════════════════════");
-  console.log("  Apate AI Automation v8");
-  console.log("  Multi-project · Subtask tracking · /report command");
+  console.log("  Apate AI Automation v8.2");
+  console.log("  Multi-project · Subtask tracking · !report command");
   console.log("═════════════════════════════════════════════════");
 
   try {
@@ -1470,6 +1491,11 @@ async function startupCheck() {
     await axios.get("https://slack.com/api/auth.test", { headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` } });
     console.log("  ✓ Slack connected");
   } catch (e) { console.error("  ✗ Slack:", e.message); process.exit(1); }
+
+  // Attempt to join all required channels (works for public channels; private need manual invite)
+  console.log("  Joining channels...");
+  await joinChannel(REPORT_CHANNEL);
+  for (const ch of Object.keys(CHANNEL_MAP)) { await joinChannel(ch); await delay(200); }
 
   console.log("  ✓ All systems go\n");
 
@@ -1528,5 +1554,5 @@ async function startupCheck() {
   console.log("  ⚠️  Unassigned alert:  Mon–Fri 9am → Saber + Michael");
   console.log("  🌙 EOD report:         daily 11:59pm");
   console.log("  🔄 Auto-tasks:         every 15 mins (5 channels)");
-  console.log("  ⚡ /report command:    every 2 mins poll\n");
+  console.log("  ⚡ !report command:    every 2 mins poll (type !report in #project-update)\n");
 })();
