@@ -10,6 +10,7 @@ const { ANTHROPIC_API_KEY, ASANA_ACCESS_TOKEN, SLACK_BOT_TOKEN, ASANA_PROJECT_GI
 const TZ         = TIMEZONE || "Australia/Sydney";
 const ASANA_BASE = "https://app.asana.com/api/1.0";
 const TASK_URL   = (gid) => `https://app.asana.com/0/0/${gid}/f`;
+const PROJ_URL   = (gid) => `https://app.asana.com/0/${gid}/list`;
 
 // All reports go to #project-update
 const REPORT_CHANNEL = "C0APBB3TAM7";
@@ -420,7 +421,7 @@ function buildPortfolioSummary(allData, now) {
     } else {
       detail += " · _On track_";
     }
-    return `${rag} *${proj.name}* — ${detail}`;
+    return `${rag} *<${PROJ_URL(proj.gid)}|${proj.name}>* — ${detail}`;
   }).join("\n");
 
   blocks.push(bkSection(`*Project status:*\n${ragLine}`));
@@ -455,7 +456,7 @@ function buildPortfolioSummary(allData, now) {
     blocks.push(bkDivider());
   }
 
-  const threadNames = allData.map(d => d.project.name).join("  ·  ");
+  const threadNames = allData.map(d => `<${PROJ_URL(d.project.gid)}|${d.project.name}>`).join("  ·  ");
   blocks.push(bkContext(`_Threads: ${threadNames}  ·  Owner Workplan_`));
   blocks.push(bkSection(`_Type \`!report\` in this channel for an on-demand private report sent to you_`));
 
@@ -1223,64 +1224,14 @@ async function sendOwnerReminders() {
 // ON-DEMAND /report COMMAND
 // Polls #project-update for "/report" messages → DMs the requester
 // ─────────────────────────────────────────────
-async function buildOnDemandReport(userId) {
-  const today    = todayStr();
-  const now      = new Date().toLocaleString("en-AU", {
+async function buildOnDemandReport() {
+  // Fetches all project data and returns portfolio summary + allData for thread building
+  const now = new Date().toLocaleString("en-AU", {
     timeZone: TZ, weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
   });
-
-  const blocks = [];
-  blocks.push(bkHeader(`⚡ On-demand Report · ${now}`));
-  blocks.push(bkContext("_Live Asana data · private to you_"));
-  blocks.push(bkDivider());
-
-  const statusLines = [];
-  for (const proj of PROJECTS) {
-    try {
-      const tasks = await fetchProjectTasks(proj.gid);
-      const open  = tasks.filter(t => !t.completed);
-      const overdue = open.filter(t => t.due_on && t.due_on < today);
-      const dueToday = open.filter(t => t.due_on === today);
-      const rag = overdue.length >= 3 ? "🔴" : overdue.length >= 1 || dueToday.length >= 2 ? "🟡" : "🟢";
-      let detail = `${open.length} open · ${tasks.filter(t => t.completed).length} closed`;
-      if (proj.goLive) detail += ` · Go-live ${proj.goLive} (${daysUntil(proj.goLive)}d)`;
-      else if (overdue.length > 0) detail += ` · ${overdue.length} overdue ⚠️`;
-      else if (dueToday.length > 0) detail += ` · ${dueToday.length} due today`;
-      statusLines.push(`${rag} *${proj.name}* — ${detail}`);
-    } catch { statusLines.push(`⚫ *${proj.name}* — unable to fetch`); }
-    await delay(200);
-  }
-
-  blocks.push(bkSection(`*Project status:*\n${statusLines.join("\n")}`));
-  blocks.push(bkDivider());
-
-  // Most urgent tasks across all projects
-  const urgentAll = [];
-  try {
-    const portalTasks = await fetchProjectTasks(PORTAL_GID);
-    const portalOpen  = portalTasks.filter(t => !isPortalClosed(t));
-    const overdue = portalOpen.filter(t => t.due_on && t.due_on < today);
-    const dueToday = portalOpen.filter(t => t.due_on === today);
-    const topPri = portalOpen.filter(t => t.name.toLowerCase().includes("top priority"));
-    [...topPri.slice(0,2), ...overdue.slice(0,3), ...dueToday.slice(0,2)].forEach(t => {
-      if (!urgentAll.find(u => u.gid === t.gid)) {
-        urgentAll.push({ ...t, projName: "Portal Stabilisation" });
-      }
-    });
-  } catch {}
-
-  if (urgentAll.length > 0) {
-    const urgentLines = urgentAll.slice(0, 5).map(t => {
-      const ds = t.due_on ? dueDateStatus(t.due_on) : null;
-      const dueStr = ds ? (ds.type === "overdue" ? `🔴 was due ${t.due_on}` : "🚨 due today") : "";
-      return `• <${TASK_URL(t.gid)}|${t.name}> · ${ownerName(t)} · ${dueStr}`;
-    }).join("\n");
-    blocks.push(bkSection(`*Most urgent right now:*\n${urgentLines}`));
-    blocks.push(bkDivider());
-  }
-
-  blocks.push(bkContext("_Type !report in #project-update any time for a fresh copy_"));
-  return { blocks, fallback: `⚡ On-demand Report · ${now}` };
+  const allData = await fetchAllProjectData();
+  const { blocks, fallback } = buildPortfolioSummary(allData, now);
+  return { summaryBlocks: blocks, summaryFallback: fallback, allData, now };
 }
 
 async function pollForReportCommand() {
@@ -1300,10 +1251,26 @@ async function pollForReportCommand() {
       // Acknowledge in channel
       await slackPost(REPORT_CHANNEL, `📊 Generating on-demand report — check your DMs in a moment`, null, null);
 
-      // DM the requester
-      const { blocks, fallback } = await buildOnDemandReport(msg.user);
-      await slackPost(msg.user, fallback, blocks);
-      console.log(`[${new Date().toISOString()}] /report → DM to ${msg.user} ✓`);
+      // Build full threaded DM — same structure as daily portfolio report
+      const { summaryBlocks, summaryFallback, allData, now } = await buildOnDemandReport();
+
+      // 1. Main DM message: portfolio summary
+      const dmMsg = await slackPost(msg.user, summaryFallback, summaryBlocks);
+      const threadTs = dmMsg.ts;
+      await delay(600);
+
+      // 2. Thread: one per project
+      for (const data of allData) {
+        const { blocks, fallback } = buildProjectThread(data, now);
+        await slackPost(msg.user, fallback, blocks, threadTs);
+        await delay(500);
+      }
+
+      // 3. Thread: owner workplan (last)
+      const { blocks: bW, fallback: fW } = buildOwnerWorkplan(allData, now);
+      await slackPost(msg.user, fW, bW, threadTs);
+
+      console.log(`[${new Date().toISOString()}] !report → threaded DM to ${msg.user} ✓`);
     }
   } catch (err) {
     const msg = err.message || "";
