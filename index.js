@@ -331,6 +331,9 @@ async function slackGetHistory(channel, oldest, limit = 50) {
     headers: { Authorization: `Bearer ${SLACK_BOT_TOKEN}` },
     params: { channel, oldest, limit },
   });
+  if (!res.data.ok) {
+    throw new Error(`conversations.history error [${channel}]: ${res.data.error}`);
+  }
   return res.data.messages || [];
 }
 
@@ -1303,11 +1306,15 @@ async function pollForReportCommand() {
       console.log(`[${new Date().toISOString()}] /report → DM to ${msg.user} ✓`);
     }
   } catch (err) {
-    // Detailed logging so Railway shows what failed
-    if (err.message.includes("channel_not_found")) {
-      console.error(`[POLL] Cannot read #project-update — bot not in channel. Invite the bot manually: /invite @PortalBot in #project-update`);
+    const msg = err.message || "";
+    if (msg.includes("channel_not_found")) {
+      console.error(`[POLL ERROR] channel_not_found for ${REPORT_CHANNEL} — invite the bot to #project-update`);
+    } else if (msg.includes("missing_scope")) {
+      console.error(`[POLL ERROR] missing_scope — add groups:history scope at api.slack.com/apps then reinstall`);
+    } else if (msg.includes("not_in_channel")) {
+      console.error(`[POLL ERROR] Bot not in channel — type @PortalBot in #project-update and click Invite`);
     } else {
-      console.error("Report command poll error:", err.message);
+      console.error(`[POLL ERROR] ${msg}`);
     }
   }
 }
@@ -1394,7 +1401,12 @@ async function autoConvertMultiChannel() {
         await delay(1000);
       }
     } catch (err) {
-      console.error(`Auto-convert error [${channelId}]:`, err.message);
+      const m = err.message || "";
+      if (m.includes("missing_scope")) {
+        console.error(`[CHANNEL ${channelId}] missing_scope — add groups:history in Slack app settings`);
+      } else {
+        console.error(`[CHANNEL ${channelId}] ${m}`);
+      }
     }
     await delay(500);
   }
@@ -1492,10 +1504,26 @@ async function startupCheck() {
     console.log("  ✓ Slack connected");
   } catch (e) { console.error("  ✗ Slack:", e.message); process.exit(1); }
 
-  // Attempt to join all required channels (works for public channels; private need manual invite)
-  console.log("  Joining channels...");
-  await joinChannel(REPORT_CHANNEL);
-  for (const ch of Object.keys(CHANNEL_MAP)) { await joinChannel(ch); await delay(200); }
+  // Verify we can read the report channel (confirms bot is invited)
+  console.log("  Verifying channel access...");
+  try {
+    await slackGetHistory(REPORT_CHANNEL, (Date.now()/1000 - 60).toString(), 1);
+    console.log(`  ✓ #project-update (${REPORT_CHANNEL}) readable`);
+  } catch (e) {
+    console.warn(`  ⚠ Cannot read ${REPORT_CHANNEL}: ${e.message}`);
+    console.warn("  ⚠ Make sure the bot is invited: type @Portal Bot in #project-update → Invite to Channel");
+    console.warn("  ⚠ Also ensure the Slack bot token has groups:history scope in api.slack.com/apps");
+  }
+
+  for (const ch of Object.keys(CHANNEL_MAP)) {
+    try {
+      await slackGetHistory(ch, (Date.now()/1000 - 60).toString(), 1);
+      console.log(`  ✓ Channel ${ch} readable`);
+    } catch (e) {
+      console.warn(`  ⚠ Cannot read ${ch}: ${e.message}`);
+    }
+    await delay(200);
+  }
 
   console.log("  ✓ All systems go\n");
 
