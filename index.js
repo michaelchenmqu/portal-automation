@@ -454,7 +454,7 @@ function buildPortfolioSummary(allData, now) {
 
   const threadNames = allData.map(d => d.project.name).join("  ·  ");
   blocks.push(bkContext(`_Threads: ${threadNames}  ·  Owner Workplan_`));
-  blocks.push(bkSection(`_Type \`/report\` in this channel for an on-demand private report_`));
+  blocks.push(bkSection(`_Type \`!report\` in this channel for an on-demand private report sent to you_`));
 
   return {
     blocks,
@@ -1289,11 +1289,13 @@ async function pollForReportCommand() {
       if (parseFloat(msg.ts) <= parseFloat(lastReportCheckTs)) continue;
       lastReportCheckTs = msg.ts;
       const text = (msg.text || "").trim().toLowerCase();
-      if (!text.startsWith("/report")) continue;
+      // Trigger: "!report" — avoids Slack's slash command interception
+      // Also catch common variants people might type
+      if (!text.startsWith("!report") && text !== "report" && !text.startsWith("report now") && !text.startsWith("status report")) continue;
       if (!msg.user) continue;
 
       // Acknowledge in channel
-      await slackPost(REPORT_CHANNEL, `📊 Sending you an on-demand report — check your DMs`, null, null);
+      await slackPost(REPORT_CHANNEL, `📊 Generating on-demand report — check your DMs in a moment`, null, null);
 
       // DM the requester
       const { blocks, fallback } = await buildOnDemandReport(msg.user);
@@ -1477,7 +1479,8 @@ async function startupCheck() {
       bkHeader("🤖 Apate AI Automation v8 — Live"),
       bkSection(
         "*5 projects tracked · Subtask owners in DMs · Date sections (McAfee + Incident Register)*\n" +
-        "*Multi-channel auto-task creation · /report on-demand · All reports → #project-update*"
+        "*Multi-channel auto-task creation · `!report` on-demand · All reports → #project-update*\n" +
+        "_⚠ If you see channel errors, make sure to invite the bot: type_ `@Portal Bot` _in #project-update_"
       ),
       bkFields([
         "*Portfolio Report*\nDaily 8am",
@@ -1485,7 +1488,7 @@ async function startupCheck() {
         "*Owner DMs*\nMon–Fri 9:30am–5:30pm",
         "*EOD Report*\nDaily 11:59pm",
         "*Auto-tasks*\nEvery 15 mins (5 channels)",
-        "*/report*\nOn-demand anytime",
+        "*!report*\nType in #project-update",
       ]),
     ]
   );
