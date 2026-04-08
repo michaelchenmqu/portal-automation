@@ -29,7 +29,7 @@ const PROJECTS = [
     type: "delivery",
     emoji: "🔴",
     sectionStyle: "board",
-    autoTaskSectionGid: "1213815704002761", // Planned
+    autoTaskSectionGid: "1213815704002761",
     boardSections: {
       "1213802028079817": "Backlog",
       "1213802028079820": "Triaged",
@@ -54,22 +54,24 @@ const PROJECTS = [
     name: "SCB Onboarding",
     type: "onboarding",
     emoji: "🏦",
-    sectionStyle: "first",
-    goLive: "2026-05-08",
-  },
-  {
-    gid: "1213903393364385",
-    name: "Incident Register",
-    type: "register",
-    emoji: "🚨",
-    sectionStyle: "date",
+    sectionStyle: "milestone",
+    goLive: "2026-04-24",
+    milestones: [
+      { gid: "1213895485869764", name: "M1 · Commercial & Pre-Deployment" },
+      { gid: "1213861009538573", name: "M2 · Kubernetes Cluster" },
+      { gid: "1213895485867287", name: "M3 · Core Services" },
+      { gid: "1213861009488784", name: "M4 · Bot Rollout" },
+      { gid: "1213866067890145", name: "M5 · Data Pipeline & Portal" },
+      { gid: "1213861406174718", name: "M6 · QA, Training & Go-Live" },
+    ],
   },
   {
     gid: "1213903393364395",
-    name: "McAfee",
+    name: "McAfee POC Onboarding",
     type: "initiative",
     emoji: "🟡",
     sectionStyle: "date",
+    goLive: "2026-04-27",
   },
   {
     gid: "1213775995515822",
@@ -89,7 +91,7 @@ const CHANNEL_MAP = {
   "C0ANQS6UQ2K": { projectGid: "1213895485856243",  sectionStyle: "first",                                label: "SCB Onboarding" },
   "C09J9HQ3TGS": { projectGid: "1213903393364385",  sectionStyle: "date",                                label: "Incident Register" },
   "C0AL9935U5D": { projectGid: "1213903393364385",  sectionStyle: "date",                                label: "Incident Register" },
-  "C0AQ37BKWP8": { projectGid: "1213903393364395",  sectionStyle: "date",                                label: "McAfee" },
+  "C0AQ37BKWP8": { projectGid: "1213903393364395",  sectionStyle: "date",                                label: "McAfee POC Onboarding" },
 };
 
 // Channels watched for auto-task creation
@@ -110,6 +112,7 @@ const OWNERS = {
   "1213861294078291": { name: "Rajat",      slack: null },
   "1213860897948766": { name: "Krishakant", slack: null },
   "1210065723415017": { name: "Dali",       slack: "U06LB8LJ50R" },
+  "1213861406458280": { name: "Brad",       slack: null },
 };
 
 const WATCH_USERS = { "U06LB8LJ50R": "Dali", "U06MSUARQ77": "Pete" };
@@ -543,6 +546,34 @@ function buildProjectThread(data, now) {
     ]));
     blocks.push(bkDivider());
 
+    // Milestone progress bars — group tasks by section GID
+    if (proj.milestones && proj.milestones.length > 0) {
+      const byMilestone = {};
+      for (const m of proj.milestones) byMilestone[m.gid] = { name: m.name, total: 0, done: 0 };
+      for (const task of tasks) {
+        const secGid = task.memberships?.[0]?.section?.gid;
+        if (secGid && byMilestone[secGid]) {
+          byMilestone[secGid].total++;
+          if (task.completed) byMilestone[secGid].done++;
+        }
+      }
+      const milestoneLines = proj.milestones.map(m => {
+        const ms = byMilestone[m.gid];
+        const pct = ms.total > 0 ? Math.round((ms.done / ms.total) * 100) : 0;
+        const bar = ms.total === 0 ? "○ Not started"
+                  : ms.done === ms.total ? "✅ Complete"
+                  : pct >= 50 ? `🟡 ${ms.done}/${ms.total} done`
+                  : `🔵 ${ms.done}/${ms.total} done`;
+        const warning = ms.total > 0 && ms.done < ms.total
+          ? tasks.filter(t => !t.completed && t.memberships?.[0]?.section?.gid === m.gid && t.due_on && t.due_on < today).length
+          : 0;
+        const warnStr = warning > 0 ? `  ⚠ ${warning} overdue` : "";
+        return `${bar}  *${m.name}*${warnStr}`;
+      }).join("\n");
+      blocks.push(bkSection(`*Milestone progress:*\n${milestoneLines}`));
+      blocks.push(bkDivider());
+    }
+
     if (overdue.length > 0) {
       const rows = overdue.map(t =>
         `• *${genericPriority(t) || "—"}*   <${TASK_URL(t.gid)}|${t.name}> · ${ownerName(t)}  _was due ${t.due_on}_`
@@ -768,7 +799,7 @@ function computePortalStats(allTasks, prevStatus) {
   };
 }
 
-function buildPortalExecBlocks(allTasks, prevStatus, prevStats, subtaskMap, now) {
+function buildPortalExecBlocks(allTasks, prevStatus, prevStats, subtaskMap, now, otherProjectsData = []) {
   const s = computePortalStats(allTasks, prevStatus);
   const p = prevStats;
   const today = todayStr();
@@ -825,6 +856,34 @@ function buildPortalExecBlocks(allTasks, prevStatus, prevStats, subtaskMap, now)
   }).join("\n");
   if (catLines) {
     blocks.push(bkSection(`*🗂 Category Overview:*\n${catLines}`));
+    blocks.push(bkDivider());
+  }
+
+  // Portfolio Overview — other active projects, compact one-line each
+  if (otherProjectsData.length > 0) {
+    const today2 = todayStr();
+    const overviewLines = otherProjectsData.map(({ project: proj, open, closed, overdue, dueToday: dt }) => {
+      const rag = overdue.length >= 3 ? "🔴"
+                : (overdue.length >= 1 || dt.length >= 2) ? "🟡"
+                : open.length === 0 ? "⚫"
+                : "🟢";
+      let detail = `${open.length} open · ${closed.length} closed`;
+      if (proj.goLive) {
+        const d = daysUntil(proj.goLive);
+        if (proj.type === "onboarding") {
+          // Add active milestone label
+          detail += ` · ${d} days to go-live`;
+        } else {
+          detail += ` · target ${proj.goLive} (${d}d)`;
+        }
+      }
+      if (overdue.length > 0) detail += ` · _${overdue.length} overdue ⚠_`;
+      else if (dt.length > 0) detail += ` · _${dt.length} due today_`;
+      else if (open.length === 0) detail += " · _no open tasks_";
+      else detail += " · _on track_";
+      return `${rag} *<${PROJ_URL(proj.gid)}|${proj.name}>* — ${detail}`;
+    }).join("\n");
+    blocks.push(bkSection(`*🗂 Portfolio Overview:*\n${overviewLines}`));
     blocks.push(bkDivider());
   }
 
@@ -967,21 +1026,49 @@ function buildPortalFullReportBlocks(allTasks, subtaskMap, prevStatus, now) {
 async function sendPortalExecutiveSummary() {
   console.log(`[${new Date().toISOString()}] Sending Portal 2hr report...`);
   try {
-    const allTasks   = await fetchProjectTasks(PORTAL_GID);
-    const subtaskMap = await buildSubtaskMap(allTasks.filter(t => !isPortalClosed(t)));
     const now = new Date().toLocaleString("en-AU", {
       timeZone: TZ, weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
     });
 
-    const { blocks: b1, fallback: f1, stats } = buildPortalExecBlocks(allTasks, previousStatus, previousStats, subtaskMap, now);
+    // Fetch Portal tasks + subtasks
+    const allTasks   = await fetchProjectTasks(PORTAL_GID);
+    const subtaskMap = await buildSubtaskMap(allTasks.filter(t => !isPortalClosed(t)));
+
+    // Fetch other projects (lightweight — no subtask map needed for overview)
+    const today = todayStr();
+    const otherProjects = PROJECTS.filter(p => p.gid !== PORTAL_GID);
+    const otherProjectsData = [];
+    for (const proj of otherProjects) {
+      try {
+        const tasks    = await fetchProjectTasks(proj.gid);
+        const open     = tasks.filter(t => !t.completed);
+        const closed   = tasks.filter(t => t.completed);
+        const overdue  = open.filter(t => t.due_on && t.due_on < today);
+        const dueToday = open.filter(t => t.due_on === today);
+        otherProjectsData.push({ project: proj, tasks, subtaskMap: {}, open, closed, overdue, dueToday });
+      } catch (e) {
+        console.warn(`[2hr] Could not fetch ${proj.name}: ${e.message}`);
+        otherProjectsData.push({ project: proj, tasks: [], subtaskMap: {}, open: [], closed: [], overdue: [], dueToday: [] });
+      }
+      await delay(300);
+    }
+
+    // Channel: Portal exec summary + portfolio overview
+    const { blocks: b1, fallback: f1, stats } = buildPortalExecBlocks(allTasks, previousStatus, previousStats, subtaskMap, now, otherProjectsData);
     const msg = await slackPost(REPORT_CHANNEL, f1, b1);
     const threadTs = msg.ts;
     await delay(800);
 
-    const { blocks: b2, fallback: f2 } = buildPortalOwnerWorkplanBlocks(allTasks, subtaskMap, previousStatus, now);
+    // Thread 1: Cross-project Owner Workplan (Portal + SCB + McAfee + ISO27001)
+    const allData = [
+      { project: PROJECTS[0], tasks: allTasks, subtaskMap, open: allTasks.filter(t => !isPortalClosed(t)), closed: allTasks.filter(t => isPortalClosed(t)), overdue: [], dueToday: [] },
+      ...otherProjectsData,
+    ];
+    const { blocks: b2, fallback: f2 } = buildOwnerWorkplan(allData, now);
     await slackPost(REPORT_CHANNEL, f2, b2, threadTs);
     await delay(500);
 
+    // Thread 2: Portal Full Report
     const { blocks: b3, fallback: f3 } = buildPortalFullReportBlocks(allTasks, subtaskMap, previousStatus, now);
     await slackPost(REPORT_CHANNEL, f3, b3, threadTs);
 
@@ -1453,8 +1540,8 @@ async function joinChannel(channelId) {
 
 async function startupCheck() {
   console.log("═════════════════════════════════════════════════");
-  console.log("  Apate AI Automation v8.2");
-  console.log("  Multi-project · Subtask tracking · !report command");
+  console.log("  Apate AI Automation v8.5");
+  console.log("  SCB + McAfee + Cross-project Owner Workplan · Portfolio overview in 2hr report");
   console.log("═════════════════════════════════════════════════");
 
   try {
@@ -1497,11 +1584,11 @@ async function startupCheck() {
   await slackPost(REPORT_CHANNEL,
     "Apate AI Automation v8 is live.",
     [
-      bkHeader("🤖 Apate AI Automation v8 — Live"),
+      bkHeader("🤖 Apate AI Automation v8.5 — Live"),
       bkSection(
-        "*5 projects tracked · Subtask owners in DMs · Date sections (McAfee + Incident Register)*\n" +
-        "*Multi-channel auto-task creation · `!report` on-demand · All reports → #project-update*\n" +
-        "_⚠ If you see channel errors, make sure to invite the bot: type_ `@Portal Bot` _in #project-update_"
+        "*4 projects: Portal · SCB Onboarding · McAfee POC · ISO27001*\n" +
+        "*2hr report: Portal tiles + Portfolio Overview + Cross-project Owner Workplan*\n" +
+        "*Daily 8am: full portfolio · `!report` anytime · All reports → #project-update*"
       ),
       bkFields([
         "*Portfolio Report*\nDaily 8am",
