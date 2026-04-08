@@ -66,12 +66,19 @@ const PROJECTS = [
     ],
   },
   {
-    gid: "1213903393364395",
+    gid: "1213967087367851",
     name: "McAfee POC Onboarding",
-    type: "initiative",
+    type: "onboarding",
     emoji: "🟡",
-    sectionStyle: "date",
-    goLive: "2026-04-27",
+    sectionStyle: "milestone",
+    goLive: "2026-04-28",
+    milestones: [
+      { gid: "1213967087367852", name: "M1 · Commercial & Pre-Deployment" },
+      { gid: "1213967260113805", name: "M2 · API on the Portal" },
+      { gid: "1213967260113812", name: "M3 · Bot Targeting" },
+      { gid: "1213967260113823", name: "M4 · Data Pipeline" },
+      { gid: "1213967087828389", name: "M5 · QA, Training & Go-Live" },
+    ],
   },
   {
     gid: "1213775995515822",
@@ -91,7 +98,7 @@ const CHANNEL_MAP = {
   "C0ANQS6UQ2K": { projectGid: "1213895485856243",  sectionStyle: "first",                                label: "SCB Onboarding" },
   "C09J9HQ3TGS": { projectGid: "1213903393364385",  sectionStyle: "date",                                label: "Incident Register" },
   "C0AL9935U5D": { projectGid: "1213903393364385",  sectionStyle: "date",                                label: "Incident Register" },
-  "C0AQ37BKWP8": { projectGid: "1213903393364395",  sectionStyle: "date",                                label: "McAfee POC Onboarding" },
+  "C0AQ37BKWP8": { projectGid: "1213967087367851",  sectionStyle: "date",                                label: "McAfee POC Onboarding" },
 };
 
 // Channels watched for auto-task creation
