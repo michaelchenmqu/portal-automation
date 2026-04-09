@@ -15,6 +15,13 @@ const PROJ_URL   = (gid) => `https://app.asana.com/0/${gid}/list`;
 // All reports go to #project-update
 const REPORT_CHANNEL = "C0APBB3TAM7";
 
+// Daily Leadership Standup — meeting notes intake
+const STANDUP_CHANNEL       = "C0AS4FZ85EV"; // dedicated meeting notes channel
+const STANDUP_PROJECT_GID   = "1213981266044708";
+const STANDUP_PRIORITY_FIELD = "1206107582127375";
+const STANDUP_PRIORITY_HIGH  = "1206107582127376";
+const STANDUP_TRIGGER_USER   = "U0ALJV2MSGK"; // Michael — only his pastes are processed
+
 // ─────────────────────────────────────────────
 // PROJECT REGISTRY
 // type: delivery | onboarding | register | initiative | compliance
@@ -88,6 +95,14 @@ const PROJECTS = [
     sectionStyle: "first",
     noAutoTask: true,
   },
+  {
+    gid: STANDUP_PROJECT_GID,
+    name: "Daily Leadership Standup",
+    type: "standup",
+    emoji: "📋",
+    sectionStyle: "date",
+    noAutoTask: true, // handled by processMeetingNotes, not CHANNEL_MAP
+  },
 ];
 
 // ─────────────────────────────────────────────
@@ -123,6 +138,29 @@ const OWNERS = {
 };
 
 const WATCH_USERS = { "U06LB8LJ50R": "Dali", "U06MSUARQ77": "Pete" };
+
+// Meeting notes name → Asana GID (first name, case-insensitive fuzzy)
+// Includes common aliases (Ian = Ean, Krishna = Krishakant, etc.)
+const MEETING_NAME_MAP = {
+  "michael":    "1209967224903860",
+  "saber":      "1213778917763529",
+  "mahit":      "1210457965895022",
+  "chayan":     "1213779385519783",
+  "pete":       "1213776006274031",
+  "peter":      "1213776006274031",
+  "adam":       "1213816590664365",
+  "ean":        "1213816539044303",
+  "ian":        "1213816539044303",  // alias
+  "brad":       "1213861406458280",
+  "dali":       "1210065723415017",
+  "hanif":      "1213863129375544",
+  "rajat":      "1213861294078291",
+  "krishakant": "1213860897948766",
+  "krishna":    "1213860897948766",  // alias
+  "krishnakant":"1213860897948766",  // alias
+};
+
+let standupLastTs = (Date.now() / 1000 - 300).toString(); // watermark for meeting notes channel
 const PRIORITY_SORT = { "High": 0, "Medium": 1, "Low": 2, "—": 3 };
 
 const STATUS_EMOJI = {
@@ -597,6 +635,9 @@ function buildProjectThread(data, now) {
       blocks.push(bkDivider());
     }
 
+  } else if (proj.type === "standup") {
+    return buildStandupThread(data, now);
+
   } else {
     // register / initiative / compliance — date-section style
     blocks.push(bkHeader(`${proj.emoji} ${proj.name} — ${now}`));
@@ -737,6 +778,249 @@ function buildOwnerWorkplan(allData, now) {
 
   blocks.push(bkContext("_Subtasks marked ↳ · ⚠ Unassigned subtasks need owners · click task names to open in Asana_"));
   return { blocks, fallback: `👥 Owner Workplan — ${sorted.length} owners · ${Object.values(byOwner).reduce((s, o) => s + o.items.length, 0)} total items` };
+}
+
+// ─────────────────────────────────────────────
+// STANDUP PROJECT THREAD BUILDER
+// Shows today's tasks grouped, plus recent history
+// ─────────────────────────────────────────────
+function buildStandupThread(data, now) {
+  const { project: proj, tasks, open, closed } = data;
+  const today = todayStr();
+  const blocks = [];
+
+  blocks.push(bkHeader(`${proj.emoji} ${proj.name} — ${now}`));
+  blocks.push(bkContext("_Daily leadership meeting action items · High priority · tasks due day of meeting_"));
+  blocks.push(bkDivider());
+
+  // Group tasks by section (date)
+  const bySection = {};
+  const sectionOrder = [];
+  for (const task of tasks) {
+    const sec = task.memberships?.[0]?.section?.name || "Unsectioned";
+    if (!bySection[sec]) { bySection[sec] = []; sectionOrder.push(sec); }
+    bySection[sec].push(task);
+  }
+
+  if (sectionOrder.length === 0) {
+    blocks.push(bkSection("_No standup tasks yet. Paste meeting notes into the meeting-notes channel to auto-create tasks._"));
+    return { blocks, fallback: `📋 Daily Leadership Standup — no tasks yet` };
+  }
+
+  // Show today's section first, then recent history (last 3 days)
+  const orderedSections = [...sectionOrder].sort((a, b) => b.localeCompare(a)).slice(0, 4);
+
+  for (const sec of orderedSections) {
+    const secTasks = bySection[sec] || [];
+    const secOpen   = secTasks.filter(t => !t.completed);
+    const secClosed = secTasks.filter(t => t.completed);
+    const isToday = sec.toUpperCase() === todayLabel().toUpperCase();
+    const sectionLabel2 = isToday ? `*📅 ${sec} — Today (${secOpen.length} open · ${secClosed.length} closed)*` : `*${sec} (${secOpen.length} open · ${secClosed.length} closed)*`;
+
+    blocks.push(bkSection(sectionLabel2));
+
+    // Notes task first (the context task, not an action item)
+    const notesTask = secTasks.find(t => t.name.startsWith("📋 Meeting Notes"));
+    if (notesTask) {
+      blocks.push(bkSection(`_<${TASK_URL(notesTask.gid)}|📋 View meeting notes & context>_`));
+    }
+
+    // Action item tasks
+    const actionTasks = secTasks.filter(t => !t.name.startsWith("📋 Meeting Notes"));
+    for (const task of actionTasks) {
+      const check   = task.completed ? "✅" : "🔴";
+      const owner   = ownerName(task);
+      const strike  = task.completed ? "~" : "";
+      blocks.push(bkSection(`${check} ${strike}*<${TASK_URL(task.gid)}|${task.name}>*${strike}
+   👤 ${owner}${task.completed ? " · _Completed_" : " · _Due today · High priority_"}`));
+    }
+    blocks.push(bkDivider());
+  }
+
+  const totalOpen = open.filter(t => !t.name.startsWith("📋 Meeting Notes")).length;
+  const totalDone = closed.filter(t => !t.name.startsWith("📋 Meeting Notes")).length;
+  blocks.push(bkContext(`_${totalOpen} open action items · ${totalDone} completed · paste meeting notes in #meeting-notes to add today's tasks_`));
+  return { blocks, fallback: `📋 Daily Leadership Standup — ${totalOpen} open action items` };
+}
+
+// ─────────────────────────────────────────────
+// PROCESS MEETING NOTES — main handler
+// Called when Michael pastes Granola notes into STANDUP_CHANNEL
+// ─────────────────────────────────────────────
+async function processMeetingNotes(text, msgTs) {
+  console.log(`[${new Date().toISOString()}] Processing meeting notes...`);
+  const today    = todayStr();
+  const dateLabel = todayLabel(); // e.g. "09 APR"
+  const now = new Date().toLocaleString("en-AU", {
+    timeZone: TZ, weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit",
+  });
+
+  // Step 1: Claude extracts body + action items
+  let parsed;
+  try {
+    const raw = await callClaude(
+      `You are processing meeting notes from a daily leadership standup. Extract:
+1. The discussion body (ALL content EXCEPT the "Action Items" section at the end)
+2. Each action item: the owner's first name and the task description
+
+IMPORTANT:
+- Remove "today" from task descriptions (already implied by due date)
+- Normalise "Ian" to "Ian" (maps to Ean in our system)
+- If no clear owner, set owner to null
+- Keep task descriptions concise (under 80 chars)
+
+Return ONLY valid JSON, no markdown:
+{"body":"...full discussion notes...","action_items":[{"owner":"FirstName or null","task":"Task description"}]}
+
+Meeting notes:
+${text.slice(0, 4000)}`,
+      "Return only valid JSON. No markdown code blocks."
+    );
+    parsed = JSON.parse(raw.replace(/```json\n?|```\n?/g, "").trim());
+  } catch (err) {
+    console.error("Claude parse error:", err.message);
+    await slackPost(REPORT_CHANNEL, "⚠️ Could not parse meeting notes — please check the format and try again.");
+    return;
+  }
+
+  const { body, action_items } = parsed;
+  if (!action_items?.length) {
+    await slackPost(REPORT_CHANNEL, "⚠️ No action items found in meeting notes. Make sure the notes include an 'Action Items' section.");
+    return;
+  }
+
+  // Step 2: Get or create date section in standup project
+  const sections = await fetchProjectSections(STANDUP_PROJECT_GID);
+  let sectionGid = sections.find(s => s.name.toUpperCase() === dateLabel.toUpperCase())?.gid;
+  if (!sectionGid) {
+    const newSec = await asanaPost(`/projects/${STANDUP_PROJECT_GID}/sections`, { name: dateLabel });
+    sectionGid = newSec.gid;
+    console.log(`Created section "${dateLabel}" in Daily Leadership Standup`);
+  }
+
+  // Step 3: Create meeting notes context task (body as description)
+  const notesTask = await asanaPost("/tasks", {
+    name:        `📋 Meeting Notes — ${dateLabel}`,
+    notes:       `DAILY LEADERSHIP STANDUP — ${dateLabel}
+${"─".repeat(40)}
+
+${body}
+
+${"─".repeat(40)}
+Auto-captured from meeting notes · ${now}`,
+    projects:    [STANDUP_PROJECT_GID],
+    memberships: [{ project: STANDUP_PROJECT_GID, section: sectionGid }],
+  });
+  console.log(`Created notes task: ${notesTask.gid}`);
+
+  // Step 4: Create action item tasks
+  const created = [];
+  const unmatched = [];
+
+  for (const item of action_items) {
+    const ownerKey = (item.owner || "").toLowerCase().trim();
+    const asanaGid = MEETING_NAME_MAP[ownerKey] || null;
+    if (item.owner && !asanaGid) unmatched.push(item.owner);
+
+    const taskBody = {
+      name:        item.task,
+      notes:       `Source: Daily Leadership Standup · ${dateLabel}
+Context: See meeting notes task for full discussion.`,
+      projects:    [STANDUP_PROJECT_GID],
+      memberships: [{ project: STANDUP_PROJECT_GID, section: sectionGid }],
+      due_on:      today,
+      custom_fields: { [STANDUP_PRIORITY_FIELD]: STANDUP_PRIORITY_HIGH },
+      ...(asanaGid && { assignee: asanaGid }),
+    };
+
+    const task = await asanaPost("/tasks", taskBody);
+    created.push({ task, ownerName: item.owner || "Unassigned", asanaGid });
+    console.log(`Created standup task: "${item.task}" → ${item.owner || "Unassigned"}`);
+    await delay(200);
+  }
+
+  // Step 5: DM each assigned owner
+  const dmSent = new Set();
+  for (const { task, ownerName: oName, asanaGid } of created) {
+    if (!asanaGid || dmSent.has(asanaGid)) continue;
+    const slackId = OWNERS[asanaGid]?.slack;
+    if (!slackId) continue;
+    dmSent.add(asanaGid);
+
+    // Collect all tasks for this owner
+    const ownerTasks = created.filter(c => c.asanaGid === asanaGid);
+    const taskLines  = ownerTasks.map(c => `🔴 *<${TASK_URL(c.task.gid)}|${c.task.name}>*\n   Due: *today* · High priority`).join("\n\n");
+
+    await slackPost(slackId,
+      `🔴 You have ${ownerTasks.length} top priority task${ownerTasks.length > 1 ? "s" : ""} from today's leadership standup`,
+      [
+        bkHeader(`📋 Daily Leadership Standup — ${dateLabel}`),
+        bkContext(`_Action items assigned to you from today's 9am meeting_`),
+        bkDivider(),
+        bkSection(`Hi *${oName}!* You have *${ownerTasks.length} top priority task${ownerTasks.length > 1 ? "s" : ""}* from today's leadership standup:
+
+${taskLines}`),
+        bkDivider(),
+        bkContext("_All due today · High priority · Update progress in Asana_"),
+      ]
+    );
+    await delay(300);
+  }
+
+  // Step 6: Post confirmation to #project-update
+  const taskLines = created.map(({ task: t, ownerName: oName, asanaGid }) => {
+    const assigned = asanaGid ? oName : `⚠ Unassigned (${oName || "unknown"})`;
+    return `• <${TASK_URL(t.gid)}|${t.name}> → ${assigned}`;
+  }).join("\n");
+
+  const unmatchedNote = unmatched.length > 0
+    ? `\n\n⚠ *${unmatched.join(", ")}* not found in team — tasks created Unassigned. Please assign manually in Asana.`
+    : "";
+
+  await slackPost(REPORT_CHANNEL, `📋 Daily Leadership Standup — ${created.length} tasks created`,
+    [
+      bkHeader(`📋 Daily Leadership Standup — ${dateLabel} · ${created.length} tasks created`),
+      bkContext(`_9am leadership meeting · High priority · all due today · Owner DMs sent_`),
+      bkDivider(),
+      bkSection(`${taskLines}${unmatchedNote}`),
+      bkDivider(),
+      bkSection(`_<${PROJ_URL(STANDUP_PROJECT_GID)}|View Daily Leadership Standup in Asana>  ·  Tasks appear in the next 2hr Owner Workplan_`),
+    ]
+  );
+
+  console.log(`[${new Date().toISOString()}] Meeting notes processed: ${created.length} tasks created ✓`);
+}
+
+// ─────────────────────────────────────────────
+// POLL MEETING NOTES CHANNEL — every 2 mins
+// Watches C0AS4FZ85EV for Michael's pastes
+// ─────────────────────────────────────────────
+async function pollMeetingNotesChannel() {
+  try {
+    const messages = await slackGetHistory(STANDUP_CHANNEL, standupLastTs, 10);
+    if (!messages.length) return;
+    const sorted = [...messages].sort((a, b) => parseFloat(a.ts) - parseFloat(b.ts));
+    for (const msg of sorted) {
+      if (parseFloat(msg.ts) <= parseFloat(standupLastTs)) continue;
+      standupLastTs = msg.ts;
+
+      // Only process messages from Michael with substantial text (not bot acks)
+      if (msg.user !== STANDUP_TRIGGER_USER) continue;
+      if (msg.bot_id) continue;
+      const text = (msg.text || "").trim();
+      if (text.length < 150) continue; // too short to be meeting notes
+
+      await slackPost(STANDUP_CHANNEL, `📋 Meeting notes received — processing and creating tasks in Asana...`);
+      await processMeetingNotes(text, msg.ts);
+    }
+  } catch (err) {
+    const m = err.message || "";
+    if (m.includes("missing_scope") || m.includes("channel_not_found") || m.includes("not_in_channel")) {
+      console.error(`[STANDUP POLL] Cannot read meeting notes channel: ${m} — invite bot to #meeting-notes`);
+    } else {
+      console.error(`[STANDUP POLL] ${m}`);
+    }
+  }
 }
 
 // ─────────────────────────────────────────────
@@ -1547,8 +1831,8 @@ async function joinChannel(channelId) {
 
 async function startupCheck() {
   console.log("═════════════════════════════════════════════════");
-  console.log("  Apate AI Automation v8.5");
-  console.log("  SCB + McAfee + Cross-project Owner Workplan · Portfolio overview in 2hr report");
+  console.log("  Apate AI Automation v8.6");
+  console.log("  Daily Leadership Standup · Meeting notes → Asana tasks · Cross-project Workplan");
   console.log("═════════════════════════════════════════════════");
 
   try {
@@ -1572,8 +1856,14 @@ async function startupCheck() {
     console.log(`  ✓ #project-update (${REPORT_CHANNEL}) readable`);
   } catch (e) {
     console.warn(`  ⚠ Cannot read ${REPORT_CHANNEL}: ${e.message}`);
-    console.warn("  ⚠ Make sure the bot is invited: type @Portal Bot in #project-update → Invite to Channel");
-    console.warn("  ⚠ Also ensure the Slack bot token has groups:history scope in api.slack.com/apps");
+    console.warn("  ⚠ Invite the bot to #project-update and ensure groups:history scope");
+  }
+  try {
+    await slackGetHistory(STANDUP_CHANNEL, (Date.now()/1000 - 60).toString(), 1);
+    console.log(`  ✓ #meeting-notes (${STANDUP_CHANNEL}) readable — paste Granola notes here after 9am meeting`);
+  } catch (e) {
+    console.warn(`  ⚠ Cannot read #meeting-notes (${STANDUP_CHANNEL}): ${e.message}`);
+    console.warn("  ⚠ Invite the bot to #meeting-notes channel");
   }
 
   for (const ch of Object.keys(CHANNEL_MAP)) {
@@ -1591,11 +1881,11 @@ async function startupCheck() {
   await slackPost(REPORT_CHANNEL,
     "Apate AI Automation v8 is live.",
     [
-      bkHeader("🤖 Apate AI Automation v8.5 — Live"),
+      bkHeader("🤖 Apate AI Automation v8.6 — Live"),
       bkSection(
-        "*4 projects: Portal · SCB Onboarding · McAfee POC · ISO27001*\n" +
-        "*2hr report: Portal tiles + Portfolio Overview + Cross-project Owner Workplan*\n" +
-        "*Daily 8am: full portfolio · `!report` anytime · All reports → #project-update*"
+        "*5 projects: Portal · SCB · McAfee POC · ISO27001 · Daily Leadership Standup*\n" +
+        "*Meeting notes: paste Granola notes in #meeting-notes → auto tasks in Asana*\n" +
+        "*2hr report: Portal + Portfolio Overview + Cross-project Owner Workplan*"
       ),
       bkFields([
         "*Portfolio Report*\nDaily 8am",
@@ -1636,6 +1926,9 @@ async function startupCheck() {
   // /report command poll: every 2 mins
   cron.schedule("*/2 * * * *", pollForReportCommand);
 
+  // Meeting notes poll: every 2 mins (separate from /report poll)
+  cron.schedule("*/2 * * * *", pollMeetingNotesChannel);
+
   console.log("✅ All schedulers running.");
   console.log("  📁 Portfolio report:   daily 8am");
   console.log("  📊 Portal 2hr:         Mon–Fri 8am–6pm → #project-update");
@@ -1643,5 +1936,6 @@ async function startupCheck() {
   console.log("  ⚠️  Unassigned alert:  Mon–Fri 9am → Saber + Michael");
   console.log("  🌙 EOD report:         daily 11:59pm");
   console.log("  🔄 Auto-tasks:         every 15 mins (5 channels)");
-  console.log("  ⚡ !report command:    every 2 mins poll (type !report in #project-update)\n");
+  console.log("  ⚡ !report command:    every 2 mins poll (type !report in #project-update)");
+  console.log("  📋 Meeting notes:      every 2 mins poll (#meeting-notes channel → Daily Leadership Standup)\n");
 })();
