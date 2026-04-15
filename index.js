@@ -44,9 +44,13 @@ const PROJECTS = [
       "1213873742595641": "Blocked",
       "1213863123247950": "In Progress",
       "1213863123247951": "Testing",
+      "1214063062340385": "Passed QA",
+      "1214063062340386": "Canary Release",
       "1213863123247952": "Done",
     },
-    doneSectionGid:      "1213863123247952",
+    doneSectionGid:        "1213863123247952",
+    passedQASectionGid:    "1214063062340385",
+    canaryReleaseSectionGid: "1214063062340386", // ← replace when confirmed
     deploymentStatusGid: "1213815710185880",
     completedStatusGid:  "1213802028079846",
     customFields: {
@@ -155,6 +159,22 @@ const DEV_SIGNAL_CHANNELS = [
 ];
 const PROD_DEPLOY_CHANNEL = "C0AHPMFEMR9"; // #production-deployments
 
+// Portal Stabilisation board section GIDs — used for automated transitions
+const PORTAL_SECTIONS = {
+  PLANNED:       "1213815704002761",
+  IN_PROGRESS:   "1213863123247950",
+  TESTING:       "1213863123247951",  // staging/canary deploy confirmation
+  PASSED_QA:     "1214063062340385",  // Slite QA doc shared → approval gate
+  CANARY_RELEASE:"1214063062340386", // ← replace when confirmed
+  DONE:          "1213863123247952",
+};
+
+// Keywords that trigger section transitions (lowercased matching)
+const APPROVAL_KEYWORDS_PETE  = ["approved", "all good", "lgtm", "ship it", "good to go", "publish", "looks good", "✅"];
+const APPROVAL_KEYWORDS_SABER = ["approved", "all good", "lgtm", "ship it", "go ahead", "good to go", "deploy it", "release it", "✅"];
+const REJECTION_KEYWORDS      = ["rejected", "revert", "needs work", "fix this", "not good", "block", "hold off", "don't ship"];
+const ROLLBACK_KEYWORDS       = ["rolled back", "rollback", "reverting", "reverted", "pulling back"];
+
 // Portal-facing repos → Pete QA gate required before prod
 const PORTAL_REPOS = new Set([
   "telegrambot", "whatsapp-bot-v2", "WhatsAppBot", "ai-callee",
@@ -194,11 +214,12 @@ const MEETING_NAME_MAP = {
 };
 
 let standupLastTs = (Date.now() / 1000 - 300).toString(); // watermark for meeting notes channel
+const approvalNotifiedTasks = new Set(); // task GIDs already DM'd to Pete/Saber — avoid repeat DMs
 const PRIORITY_SORT = { "High": 0, "Medium": 1, "Low": 2, "—": 3 };
 
 const STATUS_EMOJI = {
   "Backlog": "⬜", "Triaged": "🔷", "Planned": "🔵", "Blocked": "🚫",
-  "In Progress": "🟡", "Testing": "🟠", "Done": "🟢",
+  "In Progress": "🟡", "Testing": "🟠", "Passed QA": "✅", "Canary Release": "🕊️", "Done": "🟢",
 };
 
 // ─────────────────────────────────────────────
@@ -262,6 +283,20 @@ async function asanaPost(path, body) {
 
 async function asanaAddComment(taskGid, text) {
   return asanaPost(`/tasks/${taskGid}/stories`, { text });
+}
+
+
+async function moveAsanaTaskToSection(taskGid, sectionGid) {
+  if (!sectionGid) return; // skip placeholder GIDs
+  try {
+    await axios.post(
+      `${ASANA_BASE}/sections/${sectionGid}/addTask`,
+      { data: { task: taskGid } },
+      { headers: { Authorization: `Bearer ${ASANA_ACCESS_TOKEN}`, "Content-Type": "application/json" } }
+    );
+  } catch (e) {
+    console.warn(`[Section move] ${taskGid} → ${sectionGid}: ${e.message}`);
+  }
 }
 
 const TASK_FIELDS = "gid,name,completed,completed_at,assignee,assignee.name,assignee.gid,custom_fields,due_on,memberships,memberships.section,memberships.section.name,memberships.section.gid,num_subtasks";
@@ -796,8 +831,18 @@ function buildOwnerWorkplan(allData, now) {
           : "";
         const prefix = item.isSubtask ? `   ↳ _subtask of ${item.parentName?.slice(0, 40)}_\n     ` : "";
         const priLabel = proj?.type === "delivery" ? getPortalPriority(t) : genericPriority(t);
-        const section = item.isSubtask ? "" : ` · ${sectionLabel(t) || getPortalBoardStatus(t)}`;
-        ownerBlock += `${prefix}• *${priLabel !== "—" ? priLabel + "  " : ""}*<${TASK_URL(t.gid)}|${t.name}>${section}${dueStr}\n`;
+        const boardStatus = sectionLabel(t) || getPortalBoardStatus(t);
+        const section = item.isSubtask ? "" : ` · ${boardStatus}`;
+
+        // Show QA reviewer if task is in Passed QA section
+        let qaLine = "";
+        if (!item.isSubtask && boardStatus === "Passed QA" && item.qaReviewer) {
+          qaLine = `\n     🔬 _QA in progress — ${item.qaReviewer}_`;
+        } else if (!item.isSubtask && boardStatus === "Passed QA") {
+          qaLine = `\n     🔬 _QA in progress_`;
+        }
+
+        ownerBlock += `${prefix}• *${priLabel !== "—" ? priLabel + "  " : ""}*<${TASK_URL(t.gid)}|${t.name}>${section}${dueStr}${qaLine}\n`;
       }
 
       if (sortedItems.length > 5) {
@@ -1213,10 +1258,10 @@ async function pollDevChannels() {
           }
         }
 
-        // ── Slite URLs ────────────────────────────────────────────
+        // ── Slite URLs — link to Asana task as comment only ─────────
         const sliteLinks = extractSliteURLs(text).filter(s => !processedSignals.has(s.key));
         if (sliteLinks.length) {
-          const isQADoc = prs.length > 0;
+          const isQADoc = prs.length > 0; // alongside a PR = QA doc, standalone = planning doc
           const { asanaGid, ownerName, tasks } = await fetchOwnerOpenTasks(posterSlackId);
           for (const slite of sliteLinks) {
             processedSignals.add(slite.key);
@@ -1224,9 +1269,8 @@ async function pollDevChannels() {
             if (result.match && result.gid) {
               const docType = isQADoc ? "📋 QA doc" : "📝 Planning doc";
               await asanaAddComment(result.gid,
-                `🤖 Slite document linked (auto)\n${docType}: ${slite.url}\n` +
-                `By: ${ownerName || posterSlackId} · Confidence: ${result.confidence}% — ${result.reason}\n` +
-                `${new Date().toLocaleString("en-AU", { timeZone: TZ })}`
+                `🤖 Slite doc linked (auto)\n${docType}: ${slite.url}\n` +
+                `By: ${ownerName || posterSlackId} · ${new Date().toLocaleString("en-AU", { timeZone: TZ })}`
               );
             } else if (asanaGid && OWNERS[asanaGid]?.slack) {
               const taskLines = tasks.slice(0, 5).map(t => `• <${TASK_URL(t.gid)}|${t.name}>`).join("\n");
@@ -1295,8 +1339,11 @@ async function pollProductionDeployments() {
               `Deployed by: ${posterName} · ${timeStr}\n` +
               `Context: ${msg.text.slice(0, 200)}`
             );
-            // Move section: staging → Testing, prod → Done
-            const targetSec = ver.isStaging ? "1213863123247951" : "1213863123247952";
+            // Move section: staging → Testing, prod version → Canary Release
+            // (task moves to Done only after full prod rollout is confirmed)
+            const targetSec = ver.isStaging
+              ? PORTAL_SECTIONS.TESTING
+              : PORTAL_SECTIONS.CANARY_RELEASE;
             try {
               await axios.post(`${ASANA_BASE}/sections/${targetSec}/addTask`,
                 { data: { task: result.gid } },
@@ -1340,6 +1387,165 @@ async function pollProductionDeployments() {
     await delay(500);
   }
 }
+
+// ─────────────────────────────────────────────
+// POLL APPROVAL CHANNELS — every 2 mins
+// Watches for Pete + Saber approval/rejection keywords in Slack
+// Advances or reverts Portal Stabilisation task sections automatically
+// ─────────────────────────────────────────────
+async function pollApprovalSignals() {
+  // Poll tasks in Passed QA section → DM approver once per task
+  // Approver: Pete (Replit/portal tasks) or Saber (everything else)
+  // Detect Pete/Saber approval OR rejection keywords in Slack to advance/revert
+
+  const PETE_SLACK  = "U06MSUARQ77";
+  const SABER_SLACK = "U09FT29J3LH";
+
+  try {
+    const allTasks = await fetchProjectTasks(PORTAL_GID);
+    const passedQA = allTasks.filter(t =>
+      t.memberships?.[0]?.section?.gid === PORTAL_SECTIONS.PASSED_QA && !isPortalClosed(t)
+    );
+
+    for (const task of passedQA) {
+      if (approvalNotifiedTasks.has(task.gid)) continue; // already DM'd approver
+
+      // Determine approver: check task comments for a Replit URL → Pete, else → Saber
+      let approverSlack = SABER_SLACK;
+      let approverName  = "Saber";
+      try {
+        const stories = await axios.get(
+          `${ASANA_BASE}/tasks/${task.gid}/stories?opt_fields=text`,
+          { headers: { Authorization: `Bearer ${ASANA_ACCESS_TOKEN}` } }
+        );
+        const hasReplitLink = (stories.data.data || []).some(s =>
+          s.text && s.text.includes("replit.com/t/apateai/")
+        );
+        if (hasReplitLink) { approverSlack = PETE_SLACK; approverName = "Pete"; }
+      } catch (e) { /* default to Saber */ }
+
+      const ownerName2 = task.assignee ? (OWNERS[task.assignee.gid]?.name || task.assignee.name) : "Unknown";
+      const timeStr = new Date().toLocaleString("en-AU", { timeZone: TZ });
+
+      await slackPost(approverSlack,
+        `🔔 QA passed — approval needed`,
+        [
+          bkHeader(`🔔 Approval needed — ${task.name}`),
+          bkDivider(),
+          bkSection(
+            `*Task:* <${TASK_URL(task.gid)}|${task.name}>\n` +
+            `*Owner:* ${ownerName2}\n` +
+            `*Status:* Passed QA — awaiting your approval\n\n` +
+            `Reply with the Asana task link + one of:\n` +
+            `✅ *approved* / *looks good* / *ship it* → task moves to Canary Release\n` +
+            `❌ *rejected* / *revert* / *needs work* → task moves back to In Progress`
+          ),
+          bkContext(`_Detected at ${timeStr}_`),
+        ]
+      );
+
+      approvalNotifiedTasks.add(task.gid);
+      console.log(`[QA poll] DM sent to ${approverName} for task ${task.gid} (${task.name})`);
+      await delay(400);
+    }
+  } catch (e) {
+    console.error(`[QA poll] Passed QA fetch: ${e.message}`);
+  }
+
+  // Watch Slack for Pete/Saber approval or rejection (must include Asana task link)
+  const watchChannels = ["C0704HY2Y2E", "C09JD1U0EBW", "C09J9HQ3TGS", "C0AHPMFEMR9", "C0APBB3TAM7"];
+  const PETE_SLACK2  = "U06MSUARQ77";
+  const SABER_SLACK2 = "U09FT29J3LH";
+
+  for (const channelId of watchChannels) {
+    try {
+      const wm = devSignalLastTs[`appr_${channelId}`] || (Date.now() / 1000 - 120).toString();
+      const messages = await slackGetHistory(channelId, wm, 15);
+      if (!messages.length) continue;
+      const sorted = [...messages].sort((a, b) => parseFloat(a.ts) - parseFloat(b.ts));
+
+      for (const msg of sorted) {
+        if (parseFloat(msg.ts) <= parseFloat(devSignalLastTs[`appr_${channelId}`] || "0")) continue;
+        devSignalLastTs[`appr_${channelId}`] = msg.ts;
+        if (msg.bot_id || !msg.user || !msg.text) continue;
+
+        const isPete  = msg.user === PETE_SLACK2;
+        const isSaber = msg.user === SABER_SLACK2;
+        if (!isPete && !isSaber) continue;
+
+        // Must contain an Asana task link
+        const asanaMatch = msg.text.match(/asana\.com[^\s>)"]+\/(\d{16,})/);
+        if (!asanaMatch) continue;
+        const taskGid = asanaMatch[1];
+
+        const txt          = msg.text.toLowerCase();
+        const isApproval   = APPROVAL_KEYWORDS_PETE.some(k => txt.includes(k));
+        const isRejection  = REJECTION_KEYWORDS.some(k => txt.includes(k));
+        const isRollback   = ROLLBACK_KEYWORDS.some(k => txt.includes(k));
+        if (!isApproval && !isRejection && !isRollback) continue;
+
+        const approverName2 = isPete ? "Pete" : "Saber";
+        const timeStr2 = new Date().toLocaleString("en-AU", { timeZone: TZ });
+
+        // Find original task owner to DM
+        let ownerSlack = null;
+        let taskName2  = taskGid;
+        try {
+          const allT = await fetchProjectTasks(PORTAL_GID);
+          const t = allT.find(x => x.gid === taskGid);
+          if (t) {
+            taskName2  = t.name;
+            ownerSlack = t.assignee?.gid ? OWNERS[t.assignee.gid]?.slack : null;
+          }
+        } catch (e) { /* skip */ }
+
+        if (isApproval && !isRejection) {
+          await moveAsanaTaskToSection(taskGid, PORTAL_SECTIONS.CANARY_RELEASE);
+          await asanaAddComment(taskGid,
+            `✅ Approved by ${approverName2} · ${timeStr2}\nTask moved to Canary Release.`
+          );
+          approvalNotifiedTasks.delete(taskGid); // allow re-notify if it loops back
+          if (ownerSlack) {
+            await slackPost(ownerSlack, `✅ Approved — your task is cleared for release`,
+              [bkSection(
+                `*<${TASK_URL(taskGid)}|${taskName2}>* was approved by ${approverName2}.\n` +
+                `Task moved to *Canary Release* — ready for deployment.`
+              )]
+            );
+          }
+          console.log(`[QA poll] ✓ ${approverName2} approved ${taskGid} → Canary Release`);
+
+        } else if (isRejection || isRollback) {
+          await moveAsanaTaskToSection(taskGid, PORTAL_SECTIONS.IN_PROGRESS);
+          await asanaAddComment(taskGid,
+            `❌ ${isRollback ? "Rollback" : "Rejected"} by ${approverName2} · ${timeStr2}\n` +
+            `Task moved back to In Progress.\n` +
+            `Reason: "${msg.text.slice(0, 300)}"`
+          );
+          approvalNotifiedTasks.delete(taskGid);
+          if (ownerSlack) {
+            await slackPost(ownerSlack, `❌ ${isRollback ? "Rollback" : "QA rejected"} — action needed`,
+              [bkSection(
+                `*<${TASK_URL(taskGid)}|${taskName2}>* was ${isRollback ? "rolled back" : "rejected"} by ${approverName2}.\n` +
+                `Task moved back to *In Progress*.\n\n` +
+                `*Reason:* ${msg.text.slice(0, 300)}\n\n` +
+                `Please address the issue and move the task back to Passed QA when ready.`
+              )]
+            );
+          }
+          console.log(`[QA poll] ✗ ${approverName2} ${isRollback ? "rolled back" : "rejected"} ${taskGid} → In Progress`);
+        }
+        await delay(300);
+      }
+    } catch (err) {
+      if (!err.message?.includes("missing_scope") && !err.message?.includes("not_in_channel")) {
+        console.error(`[QA poll] ${channelId}: ${err.message}`);
+      }
+    }
+    await delay(200);
+  }
+}
+
 
 // ─────────────────────────────────────────────
 // POLL MEETING NOTES CHANNEL — every 2 mins
@@ -2181,7 +2387,7 @@ async function joinChannel(channelId) {
 
 async function startupCheck() {
   console.log("═════════════════════════════════════════════════");
-  console.log("  Apate AI Automation v8.7");
+  console.log("  Apate AI Automation v9.0");
   console.log("  Daily Leadership Standup · Meeting notes → Asana tasks · Cross-project Workplan");
   console.log("═════════════════════════════════════════════════");
 
@@ -2245,11 +2451,11 @@ async function startupCheck() {
   await slackPost(REPORT_CHANNEL,
     "Apate AI Automation v8 is live.",
     [
-      bkHeader("🤖 Apate AI Automation v8.7 — Live"),
+      bkHeader("🤖 Apate AI Automation v9.0 — Live"),
       bkSection(
-        "*5 projects: Portal · SCB · McAfee POC · ISO27001 · Daily Leadership Standup*\n" +
-        "*Dev signals: PR links + Slite URLs + version strings → Asana comments (owner-first)*\n" +
-        "*Management: Owner Workplan · deploy DMs to Michael · reviewer DMs on PR review*"
+        "*v9: Passed QA + Canary Release sections · Slite QA doc → gates Pete/Saber automatically*\n" +
+        "*Approval detection: Pete/Saber Slack keywords → task advances → DM deployer*\n" +
+        "*Full workflow: Planned → In Progress → Passed QA → Canary Release → Done*"
       ),
       bkFields([
         "*Portfolio Report*\nDaily 8am",
@@ -2296,6 +2502,9 @@ async function startupCheck() {
   // Dev signal poll: every 15 mins (#development, #team-platform, #team-intel)
   cron.schedule("*/15 * * * *", pollDevChannels);
 
+  // Approval/rejection/rollback poll: every 2 mins (Pete + Saber signals)
+  cron.schedule("*/2 * * * *", pollApprovalSignals);
+
   // Production deployments poll: every 15 mins (#production-deployments + #team-platform)
   cron.schedule("*/15 * * * *", pollProductionDeployments);
 
@@ -2309,5 +2518,6 @@ async function startupCheck() {
   console.log("  ⚡ !report command:    every 2 mins poll (type !report in #project-update)");
   console.log("  📋 Meeting notes:      every 2 mins poll (#meeting-notes channel → Daily Leadership Standup)");
   console.log("  🔗 Dev signals:        every 15 mins (#development, #team-platform, #team-intel → Asana)");
-  console.log("  🚀 Deploy signals:     every 15 mins (#production-deployments → Asana task comments)\n");
+  console.log("  🚀 Deploy signals:     every 15 mins (#production-deployments → Asana task comments)");
+  console.log("  🔑 Approval signals:   every 2 mins (Pete/Saber keywords → Passed QA/Canary/In Progress)\n");
 })();
